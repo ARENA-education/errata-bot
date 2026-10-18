@@ -13,6 +13,12 @@ and a single worker then:
      `errata-bot/<thread>` branch and opens or updates a PR against main,
   5. replies in the thread.
 
+Self-fix: each mention is first routed (route()): a short Claude call on the thread text
+alone decides whether it is about the course, this bot, or unclear. "unclear" gets a
+clarifying question and nothing else (no run, no daily-cap slot). "self" works on the
+bot's own repo, ERRATA_BOT_SELF_REPO (the Target "self" below: its own clone, allowed
+files, check, prompt, record and session); unset, the bot just says so.
+
 SECURITY. The thread is untrusted text and Claude reads it, so Claude's output is
 untrusted too. Claude has a shell, so its container holds nothing worth stealing: a
 copy of the files (no .git), `--network none`, and a placeholder login. Its only way
@@ -21,7 +27,15 @@ adds the real token on the way. Everything that holds a token happens here, outs
 the container, and files matching errata_bot.BLOCKED (dotfiles,
 .github/, infrastructure/core/, this directory) are never copied back. Pushes use the errata-bot GitHub App, which must never be on the
 protect_main ruleset's bypass list: that ruleset is what makes writing to main
-impossible.
+impossible. The route is Claude's judgement on untrusted text, and anyone can ask for a
+self-fix, so treat the route as untrusted too: it comes only from a schema-checked
+enum (a failure or anything else means the course), from a session with no repo and
+no tool beyond Read on an empty directory, and it only picks which Target's rules
+apply; a wrong route at worst opens a PR on the other repo for a human to close. A self-fix run
+copies back only errata_bot.allowed_self files (top-level *.py, *.md, *.json; never
+deploy/, legacy/ or dotfiles), checks them by compiling, never by running them, and
+gets a token for the bot's repo alone. Nothing it changes runs until a maintainer
+merges it and runs install.sh. The bot's own repo needs the same kind of ruleset on main.
 
 Configuration: environment variables, see errata-bot.env.example. Setup: README.md.
 """
@@ -38,7 +52,9 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import jwt  # PyJWT
 from slack_sdk.socket_mode import SocketModeClient
@@ -69,6 +85,8 @@ PR_CACHE = RUNS_DIR / "_pr_cache"  # open PRs' diffs and issues' comments, keyed
 PR_DIFF_MAX = 200_000  # bytes of diff kept per PR
 
 GH_REPO = os.environ["GH_REPO"]  # e.g. ARENA-education/ARENA_materials
+# The bot's own repo, for requests to change the bot itself; unset disables self-fix.
+SELF_REPO = os.environ.get("ERRATA_BOT_SELF_REPO", "").strip()
 # Channel ids (C...) the bot answers in, comma-separated. ERRATA_CHANNEL is the old name.
 ERRATA_CHANNELS = {c.strip() for c in os.environ.get("ERRATA_CHANNELS", os.environ.get("ERRATA_CHANNEL", "")).split(",") if c.strip()}
 if not ERRATA_CHANNELS:
@@ -86,6 +104,30 @@ CLAUDE_TIMEOUT = 20 * 60
 # The model that attacks a code or test fix (adversarial.py). Sonnet by default: opus
 # found more, but used the subscription's weekly allowance too fast.
 ATTACK_MODEL = os.environ.get("ERRATA_BOT_ATTACK_MODEL", "sonnet")
+# The model that decides whether a mention is about the course or the bot (route()).
+ROUTE_MODEL = os.environ.get("ERRATA_BOT_ROUTE_MODEL", "haiku")
+
+
+@dataclass(frozen=True)
+class Target:
+    """What a thread works on: the course (GH_REPO) or, for self-fix, this bot (SELF_REPO)."""
+    name: str  # "course" or "self", as route() answers
+    repo: str
+    dir: Path  # its clone on disk
+    cache: Path  # its open PRs' diffs and issues' comments
+    prompt: str  # instructions for Claude, in HERE
+    allowed: Callable[[str], bool]  # which files a fix may change
+    check: Callable[[Path, list[str]], str]  # (checkout, changed files) -> what failed, or ""
+    tag: str = ""  # PR title tag; "" means the sections the fix touches
+    adversarial: bool = True  # attack code and test fixes (adversarial.py is built around the course's tests)
+
+
+TARGETS = {"course": Target(
+    "course", GH_REPO, REPO_DIR, PR_CACHE, "prompt.md", eb.allowed,
+    lambda clean, changed: (s := eb.parse_check(clean, [f for f in changed if "/master_" in f])) and f"section {s}")}
+if SELF_REPO:
+    TARGETS["self"] = Target("self", SELF_REPO, STATE / "repo-self", RUNS_DIR / "_pr_cache_self", "prompt_self.md",
+                             eb.allowed_self, eb.self_check, tag="self", adversarial=False)
 
 jobs: "queue.Queue[dict]" = queue.Queue()
 seen: set[str] = set()  # mention ts already queued; Slack can redeliver after a reconnect
@@ -110,9 +152,9 @@ def github(method: str, path: str, token: str, body: dict | None = None) -> dict
         return json.load(resp)
 
 
-def github_diff(number: int, token: str) -> str:
+def github_diff(repo: str, number: int, token: str) -> str:
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{GH_REPO}/pulls/{number}",
+        f"https://api.github.com/repos/{repo}/pulls/{number}",
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github.diff",
                  "User-Agent": "arena-errata-bot"},
     )
@@ -120,12 +162,12 @@ def github_diff(number: int, token: str) -> str:
         return resp.read(PR_DIFF_MAX + 1).decode("utf-8", errors="replace")
 
 
-def open_items(token: str, own_branch: str, dest: Path) -> str:
+def open_items(t: Target, token: str, own_branch: str, dest: Path) -> str:
     """Write each other open PR (description, diff) and open issue (text, comments) to
     dest/pr-N.md and dest/issue-N.md, and a one-line-each index to dest/INDEX.md, for
     Claude to read only if it needs them. Returns a short summary for the prompt."""
     dest.mkdir(parents=True, exist_ok=True)
-    PR_CACHE.mkdir(parents=True, exist_ok=True)
+    t.cache.mkdir(parents=True, exist_ok=True)
 
     def pages(path: str) -> list:
         items = []
@@ -137,7 +179,7 @@ def open_items(token: str, own_branch: str, dest: Path) -> str:
         return items
 
     def cached(name: str, fetch) -> str:
-        path = PR_CACHE / name
+        path = t.cache / name
         keep.add(name)
         try:
             if not path.exists():
@@ -148,11 +190,11 @@ def open_items(token: str, own_branch: str, dest: Path) -> str:
             return ""
 
     lines, keep = [], set()
-    for pr in pages(f"/repos/{GH_REPO}/pulls?state=open"):
+    for pr in pages(f"/repos/{t.repo}/pulls?state=open"):
         if pr["head"]["ref"] == own_branch:
             continue  # this thread's own PR is shown as <existing_fix>
         n = pr["number"]
-        diff = cached(f"pr-{n}-{pr['head']['sha']}.diff", lambda: github_diff(n, token))
+        diff = cached(f"pr-{n}-{pr['head']['sha']}.diff", lambda: github_diff(t.repo, n, token))
         files = re.findall(r"^diff --git a/(\S+) b/", diff, re.M)
         if len(diff) > PR_DIFF_MAX:
             diff = diff[:PR_DIFF_MAX] + "\n[diff truncated]\n"
@@ -162,7 +204,7 @@ def open_items(token: str, own_branch: str, dest: Path) -> str:
         lines.append(f"- PR #{n} {pr['title']} | files: {shown or 'unknown'} | {pr['html_url']} | details: /github/pr-{n}.md")
 
     try:
-        issues = [i for i in pages(f"/repos/{GH_REPO}/issues?state=open") if "pull_request" not in i]
+        issues = [i for i in pages(f"/repos/{t.repo}/issues?state=open") if "pull_request" not in i]
     except Exception as e:  # e.g. the app lacks the Issues permission
         log.info("listing issues skipped: %s", e)
         issues = []
@@ -170,12 +212,12 @@ def open_items(token: str, own_branch: str, dest: Path) -> str:
         n = issue["number"]
         comments = cached(f"issue-{n}-{issue['updated_at']}.md", lambda: "\n\n".join(
             f"### {c['user']['login']}\n{c.get('body') or ''}"
-            for c in github("GET", f"/repos/{GH_REPO}/issues/{n}/comments?per_page=100", token)) if issue["comments"] else "")
+            for c in github("GET", f"/repos/{t.repo}/issues/{n}/comments?per_page=100", token)) if issue["comments"] else "")
         (dest / f"issue-{n}.md").write_text(
             f"# Issue #{n} {issue['title']}\n{issue['html_url']}\n\n{issue.get('body') or ''}\n\n## Comments\n{comments}")
         lines.append(f"- issue #{n} {issue['title']} | {issue['html_url']} | details: /github/issue-{n}.md")
 
-    for old in PR_CACHE.iterdir():
+    for old in t.cache.iterdir():
         if old.name not in keep:
             old.unlink()
     (dest / "INDEX.md").write_text("\n".join(lines) + "\n" if lines else "(no open PRs or issues)\n")
@@ -183,16 +225,18 @@ def open_items(token: str, own_branch: str, dest: Path) -> str:
     return f"{n_prs} open PRs and {len(lines) - n_prs} open issues"
 
 
-def app_token() -> str:
-    """A one-hour installation token for the errata-bot app on GH_REPO."""
+def app_token(repo: str) -> str:
+    """A one-hour installation token for the errata-bot app, limited to `repo`."""
     now = int(time.time())
     key = Path(APP_KEY_FILE).read_text()
     app_jwt = jwt.encode({"iat": now - 60, "exp": now + 540, "iss": APP_CLIENT_ID}, key, algorithm="RS256")
-    installation = github("GET", f"/repos/{GH_REPO}/installation", app_jwt)
-    return github("POST", f"/app/installations/{installation['id']}/access_tokens", app_jwt, {})["token"]
+    installation = github("GET", f"/repos/{repo}/installation", app_jwt)
+    # The app may be installed on more than one repo (self-fix): this run only gets its own.
+    return github("POST", f"/app/installations/{installation['id']}/access_tokens", app_jwt,
+                  {"repositories": [repo.split("/")[1]]})["token"]
 
 
-def git(*args: str, cwd: Path = REPO_DIR, token: str | None = None, **kw) -> str:
+def git(*args: str, cwd: Path, token: str | None = None, **kw) -> str:
     """Run git; a token, if given, goes in a header, never in the URL or the config."""
     cmd = ["git"]
     if token:
@@ -204,13 +248,14 @@ def git(*args: str, cwd: Path = REPO_DIR, token: str | None = None, **kw) -> str
     return proc.stdout
 
 
-def ensure_clone() -> None:
-    if not (REPO_DIR / ".git").exists():
-        REPO_DIR.parent.mkdir(parents=True, exist_ok=True)
-        git("clone", "--filter=blob:none", "--no-checkout", f"https://github.com/{GH_REPO}.git", str(REPO_DIR), cwd=STATE)
-    # Follow GH_REPO if it has changed since the clone was made (e.g. fork -> upstream).
-    git("remote", "set-url", "origin", f"https://github.com/{GH_REPO}.git")
-    git("worktree", "prune")
+def ensure_clone(t: Target, token: str | None = None) -> None:
+    if not (t.dir / ".git").exists():
+        t.dir.parent.mkdir(parents=True, exist_ok=True)
+        git("clone", "--filter=blob:none", "--no-checkout", f"https://github.com/{t.repo}.git", str(t.dir),
+            cwd=STATE, token=token)
+    # Follow the repo if it has changed since the clone was made (e.g. fork -> upstream).
+    git("remote", "set-url", "origin", f"https://github.com/{t.repo}.git", cwd=t.dir)
+    git("worktree", "prune", cwd=t.dir)
 
 
 # ----------------------------------------------------------------------- daily cap
@@ -267,6 +312,15 @@ def reply(channel: str, thread_ts: str, text: str) -> None:
     eb.slack("chat.postMessage", channel=channel, thread_ts=thread_ts, text=text, unfurl_links="false")
 
 
+CAP_REPLY = (f"I've reached my limit of {DAILY_CAP} reports in 24 hours, so I haven't looked at this one. "
+             "Mention me again tomorrow, or flag it to a maintainer.")
+UNCLEAR_REPLY = ("Is this about the course material (if so, which section?) or about me, the bot (how I behave or "
+                 "what I can do)? Mention me again with the answer and I'll pick it up.")
+SELF_OFF_REPLY = ("This looks like a request to change me, errata-bot, rather than the course material, but fixing "
+                  "myself isn't enabled here, so I haven't changed anything. Please flag it to a maintainer. If you "
+                  "meant the course material, say so and mention me again.")
+
+
 def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
     # Acknowledge first: Slack redelivers anything not acknowledged within 3 seconds.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
@@ -286,10 +340,10 @@ def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
     seen.add(event["ts"])
     thread_ts = event.get("thread_ts", event["ts"])
 
-    if not take_slot():
+    # The slot itself is taken once the mention is routed (handle): a clarifying question is free.
+    if runs_today() >= DAILY_CAP:
         react(event["channel"], event["ts"], "low_battery")
-        reply(event["channel"], thread_ts, f"I've reached my limit of {DAILY_CAP} reports in 24 hours, so I haven't "
-              "looked at this one. Mention me again tomorrow, or flag it to a maintainer.")
+        reply(event["channel"], thread_ts, CAP_REPLY)
         return
     react(event["channel"], event["ts"], "eyes")
     if busy.is_set() or not jobs.empty():
@@ -303,7 +357,7 @@ def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
 
 def run_claude(work: Path, prompt: str, name: str, session_dir: Path, prs: Path | None, model: str,
                resume: str = "", schema: str = "verdict.schema.json", workdir: str = "/work",
-               mounts: list[tuple[Path, str, bool]] = ()) -> str:
+               mounts: list[tuple[Path, str, bool]] = (), tools: str = "Read,Grep,Glob,Edit,Bash") -> str:
     """Run Claude Code in a throwaway container that sees only `work` (at `workdir`), this
     thread's session directory and any extra `mounts` (host path, container path,
     read-only); with `resume`, continue that earlier conversation."""
@@ -330,7 +384,7 @@ def run_claude(work: Path, prompt: str, name: str, session_dir: Path, prs: Path 
         IMAGE,
         "claude", "-p", "--model", model, *(["--resume", resume] if resume else []),
         # Bash is safe to grant only because the container holds no secret and has no network.
-        "--tools", "Read,Grep,Glob,Edit,Bash", "--permission-mode", "bypassPermissions",
+        "--tools", tools, "--permission-mode", "bypassPermissions",
         "--output-format", "json", "--json-schema", schema,
     ]
     env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
@@ -387,11 +441,11 @@ def footer(model: str, out: dict, ctx: int, cost: float) -> str:
             f"7d{pct('7d-utilization')}↻{_until(plan.get('7d-reset'))} 24h{runs_today()}/{DAILY_CAP}`")
 
 
-def pr_comments(number: int, token: str, skip: set[str] = frozenset()) -> tuple[str, list[str], set[str]]:
+def pr_comments(repo: str, number: int, token: str, skip: set[str] = frozenset()) -> tuple[str, list[str], set[str]]:
     """Everything said on a PR (conversation comments, review summaries, inline review
     comments with their file and line), oldest first, leaving out the ids in `skip`.
     Returns the text and the ids it covers."""
-    base = f"/repos/{GH_REPO}"
+    base = f"/repos/{repo}"
     items = []
     for c in github("GET", f"{base}/issues/{number}/comments?per_page=100", token):
         items.append((c["created_at"], f"c{c['id']}", c["user"]["login"], "", c.get("body") or ""))
@@ -422,16 +476,16 @@ def github_safe(text: str, allowed_logins: set[str]) -> str:
                   lambda m: m.group(0) if m.group(1).lower() in allowed else f"`@{m.group(1)}`", text)
 
 
-def post_pr_comment(number: int, verdict: dict, allowed_logins: set[str], token: str) -> str:
+def post_pr_comment(repo: str, number: int, verdict: dict, allowed_logins: set[str], token: str) -> str:
     """Post Claude's `pr_comment` on the thread's own PR, as a threaded reply to an inline
     review comment when `pr_comment_reply_to` names one (id "i<number>"). Returns its URL."""
     body = github_safe(str(verdict["pr_comment"]).strip(), allowed_logins)
     body += "\n\n<sub>Posted by errata-bot on request from Slack.</sub>"
     target = str(verdict.get("pr_comment_reply_to") or "")
     if re.fullmatch(r"i\d+", target):
-        c = github("POST", f"/repos/{GH_REPO}/pulls/{number}/comments/{target[1:]}/replies", token, {"body": body})
+        c = github("POST", f"/repos/{repo}/pulls/{number}/comments/{target[1:]}/replies", token, {"body": body})
     else:
-        c = github("POST", f"/repos/{GH_REPO}/issues/{number}/comments", token, {"body": body})
+        c = github("POST", f"/repos/{repo}/issues/{number}/comments", token, {"body": body})
     return c["html_url"]
 
 
@@ -466,6 +520,37 @@ def prune_sessions() -> None:
             record.unlink(missing_ok=True)
 
 
+def route(channel: str, ts: str, thread_ts: str, key: str) -> tuple[str, str, float]:
+    """Whether this mention asks about the course or about the bot itself: ("course",
+    "self" or "unclear", Claude's one-line reason, cost). A short session that sees the
+    thread text alone (no repo, no GitHub, Read on an empty directory); if it fails or
+    gives anything but one of those, the course."""
+    run = RUNS_DIR / f"route-{ts.replace('.', '-')}"
+    shutil.rmtree(run, ignore_errors=True)
+    (run / "work").mkdir(parents=True)
+    (run / "session").mkdir()
+    # So that "also do X" can continue whichever conversation this thread already has.
+    has = [n for n, suffix in (("course", ""), ("self", "-self")) if (THREADS / f"{key}{suffix}.json").exists()]
+    prompt = (HERE / "route.md").read_text()
+    prompt += f"\n<earlier>\nThis thread already has: {', '.join(f'a {n} conversation' for n in has) or 'nothing'}.\n</earlier>\n"
+    prompt += f"\n<thread>\n{eb.read_thread(channel, ts, thread_ts)}</thread>\n"
+    try:
+        raw = run_claude(run / "work", prompt, f"errata-route-{ts.replace('.', '-')}", run / "session", None,
+                         ROUTE_MODEL, schema="route.schema.json", tools="Read")
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+    try:
+        out = json.loads(raw)
+    except ValueError:
+        out = {}
+    out = out if isinstance(out, dict) else {}
+    answer = out.get("structured_output")
+    cost = out.get("total_cost_usd") or 0.0
+    if out.get("is_error") or not isinstance(answer, dict) or answer.get("target") not in ("course", "self", "unclear"):
+        return "course", "no valid routing answer, so the course", cost
+    return answer["target"], eb.TOKEN_RE.sub("[redacted]", " ".join(str(answer.get("reason") or "").split()))[:200], cost
+
+
 def handle(job: dict) -> str:
     """Run one mention end to end; returns the outcome reaction ("" for none)."""
     channel, ts, thread_ts = job["channel"], job["ts"], job["thread_ts"]
@@ -476,6 +561,22 @@ def handle(job: dict) -> str:
         timings[stage] = round(time.monotonic() - t0, 1)
 
     key = thread_ts.replace(".", "-")
+    where, why, route_cost = route(channel, ts, thread_ts, key)
+    mark("route")
+    log.info("route %s: %s (%s)", ts, where, why)
+    # Neither of these runs anything or counts towards the cap; the next mention is routed afresh.
+    if where == "unclear":
+        reply(channel, thread_ts, UNCLEAR_REPLY)
+        return "question"
+    if where == "self" and "self" not in TARGETS:
+        reply(channel, thread_ts, SELF_OFF_REPLY)
+        return ""
+    if not take_slot():
+        reply(channel, thread_ts, CAP_REPLY)
+        return "low_battery"
+    t = TARGETS[where]
+    # Each target has its own record, session and PR, so a thread can have one of each.
+    key += "-self" if t.name == "self" else ""
     record_path = THREADS / f"{key}.json"
     try:
         record = json.loads(record_path.read_text())  # {"session_id", "last_ts"}
@@ -488,30 +589,32 @@ def handle(job: dict) -> str:
         # Each model has its own prompt cache; resuming on another one still works, just uncached.
         log.info("thread %s switches to %s", thread_ts, model)
     permalink = eb.slack("chat.getPermalink", channel=channel, message_ts=thread_ts)["permalink"]
-    token = app_token()
+    token = app_token(t.repo)
+    ensure_clone(t, token)
     mark("slack+token")
 
     # One thread maps to one branch. If that branch has an open PR, continue it.
-    owner = GH_REPO.split("/")[0]
+    owner = t.repo.split("/")[0]
     branch = f"errata-bot/{thread_ts.replace('.', '-')}"
-    prs = github("GET", f"/repos/{GH_REPO}/pulls?head={owner}:{branch}&state=open", token)
+    prs = github("GET", f"/repos/{t.repo}/pulls?head={owner}:{branch}&state=open", token)
     pr_url = prs[0]["html_url"] if prs else ""
     comments_all = ""
     comment_ids: list[str] = []
     commenters: set[str] = set()
     if prs:
         try:
-            comments_all, comment_ids, commenters = pr_comments(prs[0]["number"], token)
+            comments_all, comment_ids, commenters = pr_comments(t.repo, prs[0]["number"], token)
             commenters.add(prs[0]["user"]["login"])
         except Exception as e:  # not worth failing the run over
             log.warning("reading comments on #%s failed: %s", prs[0]["number"], e)
-    git("fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    # The token only matters if the repo is private (the bot's own may be).
+    git("fetch", "-q", "origin", "+refs/heads/main:refs/remotes/origin/main", cwd=t.dir, token=token)
     if pr_url:
         # Into a private ref, so no branch name on the remote can clash with it locally.
-        git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/errata/thread-pr")
+        git("fetch", "-q", "origin", f"+refs/heads/{branch}:refs/errata/thread-pr", cwd=t.dir, token=token)
         base = "refs/errata/thread-pr"
     else:
-        if git("ls-remote", "--heads", "origin", branch).strip():
+        if git("ls-remote", "--heads", "origin", branch, cwd=t.dir, token=token).strip():
             branch = f"{branch}-{int(time.time())}"  # leftover from a closed PR: don't build on it
         base = "origin/main"
     mark("fetch")
@@ -521,12 +624,12 @@ def handle(job: dict) -> str:
     shutil.rmtree(run_dir, ignore_errors=True)
     work.mkdir(parents=True)
     try:
-        git("worktree", "add", "-q", "--detach", str(clean), base)
+        git("worktree", "add", "-q", "--detach", str(clean), base, cwd=t.dir)
         # Claude's copy: the same files, no .git.
-        archive = subprocess.run(["git", "archive", base], cwd=REPO_DIR, capture_output=True, check=True).stdout
+        archive = subprocess.run(["git", "archive", base], cwd=t.dir, capture_output=True, check=True).stdout
         subprocess.run(["tar", "-x", "-C", str(work)], input=archive, check=True)
         try:
-            pr_index = open_items(token, branch, run_dir / "prs")
+            pr_index = open_items(t, token, branch, run_dir / "prs")
         except Exception as e:  # not worth failing the run over
             log.warning("listing open PRs and issues failed: %s", e)
             (run_dir / "prs").mkdir(exist_ok=True)
@@ -535,7 +638,7 @@ def handle(job: dict) -> str:
             this = run_dir / "prs" / "this-pr"
             this.mkdir(parents=True, exist_ok=True)
             (this / "description.md").write_text(f"# {prs[0]['title']}\n{pr_url}\n\n{prs[0].get('body') or ''}\n")
-            (this / "diff.patch").write_text(git("diff", f"origin/main...{base}"))
+            (this / "diff.patch").write_text(git("diff", f"origin/main...{base}", cwd=t.dir))
             (this / "comments.md").write_text(comments_all or "(no comments)\n")
         new_comments = len(set(comment_ids) - set(record.get("comments_seen", [])))
         mark("checkout")
@@ -560,7 +663,7 @@ def handle(job: dict) -> str:
             else:
                 resumed = True
         if not raw:
-            prompt = (HERE / "prompt.md").read_text()
+            prompt = (HERE / t.prompt).read_text()
             if pr_url:
                 prompt += (f"\n<existing_fix>\nThis thread already has an open fix PR, {pr_url}, and its edits are "
                            "applied to your files. Its description, diff and GitHub comments are in /github/this-pr/ "
@@ -574,6 +677,8 @@ def handle(job: dict) -> str:
         # A code or test fix: say so in the thread, have a second session attack it, and
         # let the fixer revise until the attack finds nothing (adversarial.py).
         tested = None
+        if not t.adversarial:
+            verdict.pop("testing", None)  # nothing to attack, and no GPU request either
         if verdict["decision"] == "FIXED" and verdict.get("testing") == "cpu":
             reply(channel, thread_ts, eb.safe_mentions(verdict["slack_reply"], eb.thread_users(channel, ts, thread_ts))
                   + "\n\nI'm now testing this fix adversarially: a second reviewer writes correct solutions the tests "
@@ -585,7 +690,7 @@ def handle(job: dict) -> str:
                     work=work, orig=clean, run_dir=run_dir, name=name, verdict=verdict, raw=raw, model=model,
                     attack_model=ATTACK_MODEL, image=IMAGE, here=HERE, session_dir=session_dir,
                     run_claude=lambda w, p, n, sd, m, **kw: run_claude(w, p, n, sd, None, m, **kw),
-                    take_slot=take_slot, changed_files=lambda: eb.changed_allowed_files(work, clean), log=log)
+                    take_slot=take_slot, changed_files=lambda: eb.changed_allowed_files(work, clean, t.allowed), log=log)
             except Exception as e:  # the fix still gets its PR, flagged as untested
                 log.exception("adversarial testing failed")
                 tested = adversarial.Result(note=f"testing crashed on my side ({public_error(e)})")
@@ -603,7 +708,7 @@ def handle(job: dict) -> str:
         # total_cost_usd covers the whole session, so a resumed run's own cost is the difference.
         cost_total = out.get("total_cost_usd") or 0.0
         cost = cost_total - (record.get("cost_total") or 0.0) if resumed else cost_total
-        cost += tested.extra_cost if tested else 0.0
+        cost += (tested.extra_cost if tested else 0.0) + route_cost
         if session_id and verdict["decision"] not in ("ERROR", "USAGE_LIMIT"):
             THREADS.mkdir(parents=True, exist_ok=True)
             record_path.write_text(json.dumps({**record, "session_id": session_id, "last_ts": ts, "model": model,
@@ -612,11 +717,11 @@ def handle(job: dict) -> str:
 
         pushed, changed = "", []
         if verdict["decision"] == "FIXED":
-            changed = eb.changed_allowed_files(work, clean)
+            changed = eb.changed_allowed_files(work, clean, t.allowed)
             for rel in changed:
                 (clean / rel).write_bytes((work / rel).read_bytes())  # bytes, so CRLF files stay CRLF
             log.info("changed files: %s", changed or "none")
-            bad = eb.parse_check(clean, [f for f in changed if "/master_" in f]) if changed else ""
+            bad = t.check(clean, changed) if changed else ""
             mark("check")
             if not changed:
                 verdict["decision"] = "NEEDS_HUMAN"
@@ -624,18 +729,18 @@ def handle(job: dict) -> str:
             elif bad:
                 verdict["decision"] = "BUILD_FAILED"
                 verdict["slack_reply"] += (
-                    f"\n\n(I drafted a fix, but section {bad} then failed the build check, "
+                    f"\n\n(I drafted a fix, but {bad} then failed the build check, "
                     "so I have not opened a PR. This needs a maintainer.)"
                 )
             elif DRY_RUN:
                 verdict["slack_reply"] += "\n\n(Dry run: I drafted a fix but did not open a PR.)"
             else:
-                pushed = push_and_open_pr(clean, changed, verdict, branch, pr_url, permalink, token)
+                pushed = push_and_open_pr(t, clean, changed, verdict, branch, pr_url, permalink, token)
                 mark("push")
                 gpu = verdict.get("testing") == "gpu"
                 if (tested or gpu) and (m := re.search(r"/pull/(\d+)$", pushed or "")):
                     try:
-                        flag_on_pr(int(m.group(1)), tested, verdict, token)
+                        flag_on_pr(t.repo, int(m.group(1)), tested, verdict, token)
                     except Exception as e:  # the Slack reply still goes out
                         log.warning("posting the test certificate failed: %s", e)
                 if gpu:
@@ -648,7 +753,7 @@ def handle(job: dict) -> str:
             pr_link = pr_url or pushed
             if m := re.search(r"/pull/(\d+)$", pr_link or ""):
                 try:
-                    commented = post_pr_comment(int(m.group(1)), verdict, commenters, token)
+                    commented = post_pr_comment(t.repo, int(m.group(1)), verdict, commenters, token)
                 except Exception as e:  # the Slack reply still goes out
                     log.warning("posting the PR comment failed: %s", e)
                     commented = "(I couldn't post my GitHub comment; see the bot's log.)"
@@ -657,11 +762,13 @@ def handle(job: dict) -> str:
         tracked = ""
         if verdict["decision"] in ("NEEDS_HUMAN", "BUILD_FAILED") and not DRY_RUN:
             try:
-                tracked = file_issue(verdict, clean, changed if verdict["decision"] == "BUILD_FAILED" else [],
+                tracked = file_issue(t, verdict, clean, changed if verdict["decision"] == "BUILD_FAILED" else [],
                                      permalink, token, record_path)
             except Exception as e:  # e.g. no Issues permission: the Slack reply still goes out
                 log.warning("filing an issue failed: %s", e)
         text = eb.safe_mentions(verdict["slack_reply"], eb.thread_users(channel, ts, thread_ts))
+        if t.name == "self":
+            text += f"\n\n(I took this as a request to change me, errata-bot, so any PR is on {t.repo}.)"
         if model != MODEL:
             text += f"\n\n(Answered with {model}. Say \"use {MODEL}\" to switch back.)"
         if pushed:
@@ -688,34 +795,34 @@ def handle(job: dict) -> str:
         # FIXED without a push only happens in a dry run: no PR, so no ✅.
         return "" if verdict["decision"] == "FIXED" and not pushed else OUTCOME.get(verdict["decision"], "")
     finally:
-        subprocess.run(["git", "worktree", "remove", "--force", str(clean)], cwd=REPO_DIR, capture_output=True)
+        subprocess.run(["git", "worktree", "remove", "--force", str(clean)], cwd=t.dir, capture_output=True)
         shutil.rmtree(run_dir, ignore_errors=True)
 
 
-def flag_on_pr(number: int, tested, verdict: dict, token: str) -> None:
+def flag_on_pr(repo: str, number: int, tested, verdict: dict, token: str) -> None:
     """Post the adversarial test certificate, or the GPU-testing request, on the PR, and label it."""
     labels = []
     if tested:
         for body in adversarial.certificate(tested, ATTACK_MODEL):
-            github("POST", f"/repos/{GH_REPO}/issues/{number}/comments", token, {"body": eb.TOKEN_RE.sub("[redacted]", body)})
+            github("POST", f"/repos/{repo}/issues/{number}/comments", token, {"body": eb.TOKEN_RE.sub("[redacted]", body)})
         labels.append("adversarially tested" if tested.ok else "testing found gaps")
     if verdict.get("testing") == "gpu":
         plan = github_safe(str(verdict.get("test_plan") or "(no test plan given)").strip(), set())
-        github("POST", f"/repos/{GH_REPO}/issues/{number}/comments", token, {"body": (
+        github("POST", f"/repos/{repo}/issues/{number}/comments", token, {"body": (
             "## Needs GPU testing\n\nerrata-bot has no GPU, so this fix is **untested**. "
             "Before merging, a maintainer should run:\n\n" + plan)})
         labels.append("needs GPU testing")
     if labels:
         try:
-            github("POST", f"/repos/{GH_REPO}/issues/{number}/labels", token, {"labels": labels})
+            github("POST", f"/repos/{repo}/issues/{number}/labels", token, {"labels": labels})
         except urllib.error.HTTPError as e:
             log.info("labelling #%s failed: %s", number, e)
 
 
-def push_and_open_pr(clean: Path, changed: list[str], verdict: dict, branch: str, pr_url: str,
+def push_and_open_pr(t: Target, clean: Path, changed: list[str], verdict: dict, branch: str, pr_url: str,
                      permalink: str, token: str) -> str:
     assert branch.startswith("errata-bot/"), branch  # never anything else, and never main
-    title = eb.pr_title(verdict, changed, clean)
+    title = eb.pr_title(verdict, changed, clean, t.tag)
     app = github("GET", "/app", jwt.encode(
         {"iat": int(time.time()) - 60, "exp": int(time.time()) + 540, "iss": APP_CLIENT_ID},
         Path(APP_KEY_FILE).read_text(), algorithm="RS256"))
@@ -725,7 +832,7 @@ def push_and_open_pr(clean: Path, changed: list[str], verdict: dict, branch: str
     git("add", "--", *changed, cwd=clean)
     git("-c", f"user.name={bot_login}", "-c", f"user.email={bot_id}+{bot_login}@users.noreply.github.com",
         "commit", "-q", "-m", title, cwd=clean)
-    git("push", "-q", f"https://github.com/{GH_REPO}.git", f"HEAD:refs/heads/{branch}", cwd=clean, token=token)
+    git("push", "-q", f"https://github.com/{t.repo}.git", f"HEAD:refs/heads/{branch}", cwd=clean, token=token)
     if pr_url:
         return pr_url
 
@@ -734,17 +841,20 @@ def push_and_open_pr(clean: Path, changed: list[str], verdict: dict, branch: str
         "Opened automatically by errata-bot from a Slack report. "
         "The diagnosis and the fix are both unreviewed: please check them before merging.\n"
     )
-    pr = github("POST", f"/repos/{GH_REPO}/pulls", token, {"title": title, "head": branch, "base": "main", "body": body})
-    # Bot PRs count as CONTRIBUTOR, so pr-preview.yml only publishes their website
-    # preview once they carry the `preview` label.
-    try:
-        github("POST", f"/repos/{GH_REPO}/issues/{pr['number']}/labels", token, {"labels": ["preview"]})
-    except urllib.error.HTTPError as e:
-        log.warning("could not add preview label to PR #%s: %s", pr["number"], e)
+    if t.name == "self":
+        body += "\nA change to errata-bot itself: it only goes live when a maintainer runs `deploy/install.sh` after merging.\n"
+    pr = github("POST", f"/repos/{t.repo}/pulls", token, {"title": title, "head": branch, "base": "main", "body": body})
+    # Course PRs from the bot count as CONTRIBUTOR, so pr-preview.yml only publishes
+    # their website preview once they carry the `preview` label.
+    if t.name == "course":
+        try:
+            github("POST", f"/repos/{t.repo}/issues/{pr['number']}/labels", token, {"labels": ["preview"]})
+        except urllib.error.HTTPError as e:
+            log.warning("could not add preview label to PR #%s: %s", pr["number"], e)
     return pr["html_url"]
 
 
-def file_issue(verdict: dict, clean: Path, changed: list[str], permalink: str, token: str,
+def file_issue(t: Target, verdict: dict, clean: Path, changed: list[str], permalink: str, token: str,
                record_path: Path) -> str:
     """Track a report the bot could not fix as a GitHub issue: a comment on this thread's
     earlier issue, or on the open issue Claude named, or else a new issue. Returns its URL."""
@@ -762,18 +872,18 @@ def file_issue(verdict: dict, clean: Path, changed: list[str], permalink: str, t
     target = record.get("issue")
     if not target and isinstance(verdict.get("related_issue"), int):
         try:
-            issue = github("GET", f"/repos/{GH_REPO}/issues/{verdict['related_issue']}", token)
+            issue = github("GET", f"/repos/{t.repo}/issues/{verdict['related_issue']}", token)
             if issue["state"] == "open" and "pull_request" not in issue:
                 target = issue["number"]
         except urllib.error.HTTPError:
             pass
     if target:
-        github("POST", f"/repos/{GH_REPO}/issues/{target}/comments", token, {"body": body})
-        url = f"https://github.com/{GH_REPO}/issues/{target}"
+        github("POST", f"/repos/{t.repo}/issues/{target}/comments", token, {"body": body})
+        url = f"https://github.com/{t.repo}/issues/{target}"
     else:
         title = eb.pr_title({"pr_title": verdict.get("issue_title") or verdict.get("pr_title"),
-                             "section": verdict.get("section")}, changed, clean)
-        issue = github("POST", f"/repos/{GH_REPO}/issues", token, {"title": title, "body": body})
+                             "section": verdict.get("section")}, changed, clean, t.tag)
+        issue = github("POST", f"/repos/{t.repo}/issues", token, {"title": title, "body": body})
         target, url = issue["number"], issue["html_url"]
     record["issue"] = target
     THREADS.mkdir(parents=True, exist_ok=True)
@@ -824,13 +934,14 @@ def worker() -> None:
 def main() -> None:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     auth_proxy.serve(AUTH_DIR / "anthropic.sock", auth_proxy.tokens_from_env())
-    ensure_clone()
+    ensure_clone(TARGETS["course"])  # the self clone is made on its first run, with a token in case it is private
     threading.Thread(target=worker, daemon=True).start()
     client = SocketModeClient(app_token=os.environ["SLACK_APP_TOKEN"])
     client.socket_mode_request_listeners.append(on_request)
     client.connect()  # reconnects by itself if the connection drops
-    log.info("connected; mentions in %s -> %s (model %s, cap %d/24h%s)",
-             ",".join(sorted(ERRATA_CHANNELS)), GH_REPO, f"{MODEL} of {','.join(MODELS)}", DAILY_CAP, ", DRY RUN" if DRY_RUN else "")
+    log.info("connected; mentions in %s -> %s%s (model %s, cap %d/24h%s)",
+             ",".join(sorted(ERRATA_CHANNELS)), GH_REPO, f", self-fix -> {SELF_REPO}" if SELF_REPO else "",
+             f"{MODEL} of {','.join(MODELS)}", DAILY_CAP, ", DRY RUN" if DRY_RUN else "")
     threading.Event().wait()
 
 

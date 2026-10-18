@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "target",
+    "reason"
+  ],
+  "properties": {
+    "target": {
+      "type": "string",
+      "enum": [
+        "course",
+        "self",
+        "unclear"
+      ],
+      "description": "'course' for anything about the course material (almost every mention); 'self' only for a request that is clearly about the bot's own behaviour or capabilities; 'unclear' only for real ambiguity."
+    },
+    "reason": {
+      "type": "string",
+      "description": "One short line saying why. Logged only, never posted."
+    }
+  }
+}
