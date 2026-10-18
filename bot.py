@@ -13,9 +13,11 @@ and a single worker then:
      `errata-bot/<thread>` branch and opens or updates a PR against main,
   5. replies in the thread.
 
-Self-fix: with ERRATA_BOT_SELF_REPO set, a maintainer can say "@errata-bot fix yourself
-..." to start a thread that works on the bot's own repo instead (the Target "self"
-below: its own clone, allowed files, check and prompt). The thread keeps that target.
+Self-fix: each mention is first routed (route()): a short Claude call on the thread text
+alone decides whether it is about the course, this bot, or unclear. "unclear" gets a
+clarifying question and nothing else (no run, no daily-cap slot). "self" works on the
+bot's own repo, ERRATA_BOT_SELF_REPO (the Target "self" below: its own clone, allowed
+files, check, prompt, record and session); unset, the bot just says so.
 
 SECURITY. The thread is untrusted text and Claude reads it, so Claude's output is
 untrusted too. Claude has a shell, so its container holds nothing worth stealing: a
@@ -25,11 +27,15 @@ adds the real token on the way. Everything that holds a token happens here, outs
 the container, and files matching errata_bot.BLOCKED (dotfiles,
 .github/, infrastructure/core/, this directory) are never copied back. Pushes use the errata-bot GitHub App, which must never be on the
 protect_main ruleset's bypass list: that ruleset is what makes writing to main
-impossible. A self-fix thread (maintainers only, picked by the mention text and never
-by Claude) copies back only errata_bot.allowed_self files (top-level *.py, *.md,
-*.json; never deploy/, legacy/ or dotfiles) and only checks them by compiling, never by
-running them; nothing it changes runs until a maintainer merges it and runs install.sh.
-The bot's own repo needs the same kind of ruleset on main.
+impossible. The route is Claude's judgement on untrusted text, and anyone can ask for a
+self-fix, so treat the route as untrusted too: it comes only from a schema-checked
+enum (a failure or anything else means the course), from a session with no repo and
+no tool beyond Read on an empty directory, and it only picks which Target's rules
+apply; a wrong route at worst opens a PR on the other repo for a human to close. A self-fix run
+copies back only errata_bot.allowed_self files (top-level *.py, *.md, *.json; never
+deploy/, legacy/ or dotfiles), checks them by compiling, never by running them, and
+gets a token for the bot's repo alone. Nothing it changes runs until a maintainer
+merges it and runs install.sh. The bot's own repo needs the same kind of ruleset on main.
 
 Configuration: environment variables, see errata-bot.env.example. Setup: README.md.
 """
@@ -79,9 +85,8 @@ PR_CACHE = RUNS_DIR / "_pr_cache"  # open PRs' diffs and issues' comments, keyed
 PR_DIFF_MAX = 200_000  # bytes of diff kept per PR
 
 GH_REPO = os.environ["GH_REPO"]  # e.g. ARENA-education/ARENA_materials
-# The bot's own repo, for self-fix threads (maintainers only); unset disables self-fix.
+# The bot's own repo, for requests to change the bot itself; unset disables self-fix.
 SELF_REPO = os.environ.get("ERRATA_BOT_SELF_REPO", "").strip()
-SELF_RE = re.compile(r"\bfix\s+yourself\b", re.I)
 # Channel ids (C...) the bot answers in, comma-separated. ERRATA_CHANNEL is the old name.
 ERRATA_CHANNELS = {c.strip() for c in os.environ.get("ERRATA_CHANNELS", os.environ.get("ERRATA_CHANNEL", "")).split(",") if c.strip()}
 if not ERRATA_CHANNELS:
@@ -99,12 +104,14 @@ CLAUDE_TIMEOUT = 20 * 60
 # The model that attacks a code or test fix (adversarial.py). Sonnet by default: opus
 # found more, but used the subscription's weekly allowance too fast.
 ATTACK_MODEL = os.environ.get("ERRATA_BOT_ATTACK_MODEL", "sonnet")
+# The model that decides whether a mention is about the course or the bot (route()).
+ROUTE_MODEL = os.environ.get("ERRATA_BOT_ROUTE_MODEL", "haiku")
 
 
 @dataclass(frozen=True)
 class Target:
     """What a thread works on: the course (GH_REPO) or, for self-fix, this bot (SELF_REPO)."""
-    name: str  # "course" or "self", as kept in the thread's record
+    name: str  # "course" or "self", as route() answers
     repo: str
     dir: Path  # its clone on disk
     cache: Path  # its open PRs' diffs and issues' comments
@@ -305,6 +312,15 @@ def reply(channel: str, thread_ts: str, text: str) -> None:
     eb.slack("chat.postMessage", channel=channel, thread_ts=thread_ts, text=text, unfurl_links="false")
 
 
+CAP_REPLY = (f"I've reached my limit of {DAILY_CAP} reports in 24 hours, so I haven't looked at this one. "
+             "Mention me again tomorrow, or flag it to a maintainer.")
+UNCLEAR_REPLY = ("Is this about the course material (if so, which section?) or about me, the bot (how I behave or "
+                 "what I can do)? Mention me again with the answer and I'll pick it up.")
+SELF_OFF_REPLY = ("This looks like a request to change me, errata-bot, rather than the course material, but fixing "
+                  "myself isn't enabled here, so I haven't changed anything. Please flag it to a maintainer. If you "
+                  "meant the course material, say so and mention me again.")
+
+
 def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
     # Acknowledge first: Slack redelivers anything not acknowledged within 3 seconds.
     client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
@@ -324,51 +340,16 @@ def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
     seen.add(event["ts"])
     thread_ts = event.get("thread_ts", event["ts"])
 
-    target, refusal = pick_target(thread_ts, event.get("user", ""), event.get("text", ""))
-    if refusal:
-        reply(event["channel"], thread_ts, refusal)
-        log.info("refused %s (thread %s): %s", event["ts"], thread_ts, refusal)
-        return
-    if not take_slot():
+    # The slot itself is taken once the mention is routed (handle): a clarifying question is free.
+    if runs_today() >= DAILY_CAP:
         react(event["channel"], event["ts"], "low_battery")
-        reply(event["channel"], thread_ts, f"I've reached my limit of {DAILY_CAP} reports in 24 hours, so I haven't "
-              "looked at this one. Mention me again tomorrow, or flag it to a maintainer.")
+        reply(event["channel"], thread_ts, CAP_REPLY)
         return
     react(event["channel"], event["ts"], "eyes")
     if busy.is_set() or not jobs.empty():
         react(event["channel"], event["ts"], QUEUED)
-    jobs.put({"channel": event["channel"], "ts": event["ts"], "thread_ts": thread_ts, "text": event.get("text", ""),
-              "target": target})
-    log.info("queued %s (thread %s, %s); %d waiting", event["ts"], thread_ts, target, jobs.qsize())
-
-
-def pick_target(thread_ts: str, user: str, text: str) -> tuple[str, str]:
-    """The thread's target ("course" or "self"), or ("", a reply saying why not). A thread's
-    first accepted mention picks it ("fix yourself" means self) and it is kept in the
-    thread's record from then on, so a thread never changes target. Only the mention
-    text and the sender decide this, never Claude; self-fix is for maintainers only."""
-    path = THREADS / f"{thread_ts.replace('.', '-')}.json"
-    try:
-        record = json.loads(path.read_text())
-    except (OSError, ValueError):
-        record = None
-    asked = bool(SELF_RE.search(text))
-    if record is not None:
-        target = record.get("target", "course")  # threads from before self-fix are course threads
-    else:
-        target = "self" if asked else "course"
-    if asked and target == "course":
-        return "", ("This thread is about the course material, so I'll keep working on that here. To have me "
-                    "fix myself, start a new thread with \"@errata-bot fix yourself\" and what to change.")
-    if target == "self" and "self" not in TARGETS:
-        return "", "Fixing myself isn't enabled here (ERRATA_BOT_SELF_REPO is not set), so I haven't done anything."
-    if target == "self" and user not in eb.MAINTAINERS:
-        return "", ("Sorry, only maintainers can ask me to change my own code, so I haven't done anything. "
-                    "If you've found a problem with me, please flag it to a maintainer.")
-    if (record or {}).get("target") != target:
-        THREADS.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({**(record or {}), "target": target}))
-    return target, ""
+    jobs.put({"channel": event["channel"], "ts": event["ts"], "thread_ts": thread_ts, "text": event.get("text", "")})
+    log.info("queued %s (thread %s); %d waiting", event["ts"], thread_ts, jobs.qsize())
 
 
 # ----------------------------------------------------------------------------- run
@@ -376,7 +357,7 @@ def pick_target(thread_ts: str, user: str, text: str) -> tuple[str, str]:
 
 def run_claude(work: Path, prompt: str, name: str, session_dir: Path, prs: Path | None, model: str,
                resume: str = "", schema: str = "verdict.schema.json", workdir: str = "/work",
-               mounts: list[tuple[Path, str, bool]] = ()) -> str:
+               mounts: list[tuple[Path, str, bool]] = (), tools: str = "Read,Grep,Glob,Edit,Bash") -> str:
     """Run Claude Code in a throwaway container that sees only `work` (at `workdir`), this
     thread's session directory and any extra `mounts` (host path, container path,
     read-only); with `resume`, continue that earlier conversation."""
@@ -403,7 +384,7 @@ def run_claude(work: Path, prompt: str, name: str, session_dir: Path, prs: Path 
         IMAGE,
         "claude", "-p", "--model", model, *(["--resume", resume] if resume else []),
         # Bash is safe to grant only because the container holds no secret and has no network.
-        "--tools", "Read,Grep,Glob,Edit,Bash", "--permission-mode", "bypassPermissions",
+        "--tools", tools, "--permission-mode", "bypassPermissions",
         "--output-format", "json", "--json-schema", schema,
     ]
     env = {k: os.environ[k] for k in ("PATH", "HOME") if k in os.environ}
@@ -536,20 +517,43 @@ def prune_sessions() -> None:
     for record in THREADS.glob("*.json") if THREADS.exists() else []:
         if record.stat().st_mtime < cutoff:
             shutil.rmtree(SESSIONS / record.stem, ignore_errors=True)
-            try:
-                target = json.loads(record.read_text()).get("target")
-            except (OSError, ValueError):
-                target = None
-            if target == "self":  # keep that much, so the thread never drifts back to the course
-                record.write_text(json.dumps({"target": target}))
-            else:
-                record.unlink(missing_ok=True)
+            record.unlink(missing_ok=True)
+
+
+def route(channel: str, ts: str, thread_ts: str, key: str) -> tuple[str, str, float]:
+    """Whether this mention asks about the course or about the bot itself: ("course",
+    "self" or "unclear", Claude's one-line reason, cost). A short session that sees the
+    thread text alone (no repo, no GitHub, Read on an empty directory); if it fails or
+    gives anything but one of those, the course."""
+    run = RUNS_DIR / f"route-{ts.replace('.', '-')}"
+    shutil.rmtree(run, ignore_errors=True)
+    (run / "work").mkdir(parents=True)
+    (run / "session").mkdir()
+    # So that "also do X" can continue whichever conversation this thread already has.
+    has = [n for n, suffix in (("course", ""), ("self", "-self")) if (THREADS / f"{key}{suffix}.json").exists()]
+    prompt = (HERE / "route.md").read_text()
+    prompt += f"\n<earlier>\nThis thread already has: {', '.join(f'a {n} conversation' for n in has) or 'nothing'}.\n</earlier>\n"
+    prompt += f"\n<thread>\n{eb.read_thread(channel, ts, thread_ts)}</thread>\n"
+    try:
+        raw = run_claude(run / "work", prompt, f"errata-route-{ts.replace('.', '-')}", run / "session", None,
+                         ROUTE_MODEL, schema="route.schema.json", tools="Read")
+    finally:
+        shutil.rmtree(run, ignore_errors=True)
+    try:
+        out = json.loads(raw)
+    except ValueError:
+        out = {}
+    out = out if isinstance(out, dict) else {}
+    answer = out.get("structured_output")
+    cost = out.get("total_cost_usd") or 0.0
+    if out.get("is_error") or not isinstance(answer, dict) or answer.get("target") not in ("course", "self", "unclear"):
+        return "course", "no valid routing answer, so the course", cost
+    return answer["target"], eb.TOKEN_RE.sub("[redacted]", " ".join(str(answer.get("reason") or "").split()))[:200], cost
 
 
 def handle(job: dict) -> str:
     """Run one mention end to end; returns the outcome reaction ("" for none)."""
     channel, ts, thread_ts = job["channel"], job["ts"], job["thread_ts"]
-    t = TARGETS[job.get("target", "course")]
     t0 = time.monotonic()
     timings = {}
 
@@ -557,6 +561,22 @@ def handle(job: dict) -> str:
         timings[stage] = round(time.monotonic() - t0, 1)
 
     key = thread_ts.replace(".", "-")
+    where, why, route_cost = route(channel, ts, thread_ts, key)
+    mark("route")
+    log.info("route %s: %s (%s)", ts, where, why)
+    # Neither of these runs anything or counts towards the cap; the next mention is routed afresh.
+    if where == "unclear":
+        reply(channel, thread_ts, UNCLEAR_REPLY)
+        return "question"
+    if where == "self" and "self" not in TARGETS:
+        reply(channel, thread_ts, SELF_OFF_REPLY)
+        return ""
+    if not take_slot():
+        reply(channel, thread_ts, CAP_REPLY)
+        return "low_battery"
+    t = TARGETS[where]
+    # Each target has its own record, session and PR, so a thread can have one of each.
+    key += "-self" if t.name == "self" else ""
     record_path = THREADS / f"{key}.json"
     try:
         record = json.loads(record_path.read_text())  # {"session_id", "last_ts"}
@@ -688,7 +708,7 @@ def handle(job: dict) -> str:
         # total_cost_usd covers the whole session, so a resumed run's own cost is the difference.
         cost_total = out.get("total_cost_usd") or 0.0
         cost = cost_total - (record.get("cost_total") or 0.0) if resumed else cost_total
-        cost += tested.extra_cost if tested else 0.0
+        cost += (tested.extra_cost if tested else 0.0) + route_cost
         if session_id and verdict["decision"] not in ("ERROR", "USAGE_LIMIT"):
             THREADS.mkdir(parents=True, exist_ok=True)
             record_path.write_text(json.dumps({**record, "session_id": session_id, "last_ts": ts, "model": model,
@@ -747,6 +767,8 @@ def handle(job: dict) -> str:
             except Exception as e:  # e.g. no Issues permission: the Slack reply still goes out
                 log.warning("filing an issue failed: %s", e)
         text = eb.safe_mentions(verdict["slack_reply"], eb.thread_users(channel, ts, thread_ts))
+        if t.name == "self":
+            text += f"\n\n(I took this as a request to change me, errata-bot, so any PR is on {t.repo}.)"
         if model != MODEL:
             text += f"\n\n(Answered with {model}. Say \"use {MODEL}\" to switch back.)"
         if pushed:

@@ -17,7 +17,7 @@ It only ever acts when mentioned, and it only ever reads the thread it was menti
 @errata-bot in #errata
   -> Slack Socket Mode (an outbound connection from the server; no public URL)
   -> bot.py: 👀 straight away, then one job at a time:
-       read the thread -> check out main (or the thread's PR branch) from a clone kept
+       read the thread -> route it (the course, or the bot itself?) -> check out main (or the thread's PR branch) from a clone kept
        on disk -> Claude Code in a throwaway container -> copy back allowed files,
        parse-check -> push errata-bot/<thread> branch, open/update PR -> reply
 ```
@@ -30,7 +30,8 @@ the time Claude spends on the report.
 | `bot.py` | The service. Read its SECURITY note before editing. |
 | `errata_bot.py` | Shared helpers: Slack calls, blocked paths, parse-check, verdicts. |
 | `prompt.md` | What Claude is told: the triage rubric and master-file rules. |
-| `prompt_self.md` | What Claude is told instead in a self-fix thread (see below). |
+| `prompt_self.md` | What Claude is told instead for a change to the bot itself (see below). |
+| `route.md`, `route.schema.json` | The routing step: is a mention about the course or the bot? |
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
 | `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's packages. No network. |
@@ -63,21 +64,32 @@ the course repo and is not wired up here.
 
 ## Fixing itself
 
-With `ERRATA_BOT_SELF_REPO` set (e.g. `ARENA-education/errata-bot`), a maintainer can
-start a new thread with `@errata-bot fix yourself` and what to change. That thread then
-works on the bot's own repo instead of the course: it opens or updates a
-`[errata-bot][self]` PR there, and every later mention in it does too. A course thread
-never switches: saying "fix yourself" in one gets a reply asking for a new thread.
+Before each run, a short routing step decides whether the mention is about the course
+or about the bot itself: Claude (`ERRATA_BOT_ROUTE_MODEL`, default haiku) reads the
+thread text only (`route.md`), and answers `course`, `self` or `unclear` in a fixed
+schema (`route.schema.json`). Almost everything is `course`, including bug reports that
+mention or complain about the bot. `self` is for requests about the bot's own behaviour
+or capabilities, e.g. "tell your master to add you image seeing capabilities". If the
+routing call fails, it is `course`.
 
-- Only people in `ERRATA_MAINTAINERS` can do this, in a new thread or in a follow-up;
-  anyone else gets a polite refusal and nothing runs (asking it to "do it anyway" does
-  not change that). Unset, the bot says self-fix is not enabled.
+- `unclear`: the bot asks one short question ("the course material, or me?") and does
+  nothing else; no daily-cap slot is used. The next mention is routed again, with the
+  answer in the thread.
+- `self`, with `ERRATA_BOT_SELF_REPO` set (e.g. `ARENA-education/errata-bot`): the run
+  works on the bot's own repo with `prompt_self.md` and opens or updates a
+  `[errata-bot][self]` PR there. Anyone can ask; the PR review, and the fact that nothing
+  goes live until a maintainer runs `deploy/install.sh`, are the gate. Unset, the bot
+  replies that self-fixing isn't enabled and runs nothing.
+- Each mention is routed on its own, so one thread can have a course PR and a self PR,
+  each with its own branch, conversation and record. A follow-up such as "also add X" in
+  a thread with a self PR goes to that PR.
 - It can only change existing top-level `*.py`, `*.md` and `*.json` files. `deploy/`
   (which runs as root), `legacy/` and dotfiles such as `.github/` are always blocked.
+  What it can't change (a Slack scope in `deploy/slack-manifest.yml`, the Dockerfile,
+  `install.sh`) it lists in the PR and the reply for a maintainer to do; if it can do
+  nothing, it files an issue on the bot's repo.
 - Changed files are compiled (`.py`) or parsed (`.json`) before the PR, never run. There
   is no adversarial testing.
-- A merged change does nothing until a maintainer pulls it on the server and runs
-  `deploy/install.sh`.
 - Install the same GitHub App on the bot's repo (same permissions), and give that repo a
   ruleset on `main` like `protect_main`, with the app **not** on its bypass list. Each
   run's token is limited to the one repo it works on.
