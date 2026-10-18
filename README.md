@@ -17,9 +17,10 @@ It only ever acts when mentioned, and it only ever reads the thread it was menti
 @errata-bot in #errata
   -> Slack Socket Mode (an outbound connection from the server; no public URL)
   -> bot.py: 👀 straight away, then one job at a time:
-       read the thread -> route it (the course, the slides, or the bot itself?) -> check out main (or the thread's PR branch) from a clone kept
-       on disk -> Claude Code in a throwaway container -> copy back allowed files,
-       parse-check -> push errata-bot/<thread> branch, open/update PR -> reply
+       read the thread -> check out main (or the thread's PR branch) of each repo from a clone kept
+       on disk -> Claude Code in a throwaway container, which decides what to change where
+       -> per changed repo: copy back allowed files, check, push errata-bot/<thread>
+       branch, open/update PR -> reply
 ```
 
 Nothing is installed or downloaded per run, so the time to a reply is essentially
@@ -29,9 +30,8 @@ the time Claude spends on the report.
 | --- | --- |
 | `bot.py` | The service. Read its SECURITY note before editing. |
 | `errata_bot.py` | Shared helpers: Slack calls, blocked paths, parse-check, verdicts. |
-| `prompt.md` | What Claude is told: the triage rubric and master-file rules. |
-| `prompt_self.md`, `prompt_slides.md` | What Claude is told instead for a change to the bot itself, or to the slide decks (see below). |
-| `route.md`, `route.schema.json` | The routing step: is a mention about the course, the slides or the bot? |
+| `prompt.md` | What Claude is told: which repo a mention is about, the triage rubric and master-file rules. |
+| `prompt_self.md`, `prompt_slides.md` | Appended to it when the bot's own repo, or the slide decks, are enabled (see below). |
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
 | `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's packages. No network. |
@@ -64,31 +64,30 @@ the course repo and is not wired up here.
 
 ## Targets: the course, the slides, and itself
 
-Before each run, a short routing step decides what the mention is about: Claude
-(`ERRATA_BOT_ROUTE_MODEL`, default haiku) reads the thread text only (`route.md`), and
-answers `course`, `slides`, `self` or `unclear` in a fixed schema (`route.schema.json`).
-Almost everything is `course`, including bug reports that mention or complain about the
-bot, and reports about an exercise or notebook whose topic also has slides. If the
-routing call fails, it is `course`.
+Every run sees every enabled repo: the course at `/work` in the container, and the bot's
+own repo at `/bot` and the slide decks at `/slides` if they are set. There is no separate
+routing step: Claude reads the thread and decides which repo (if any) to change, with
+the guidance in `prompt.md` ("Which repository"). Almost everything is the course,
+including bug reports that mention or complain about the bot, and reports about an
+exercise or notebook whose topic also has slides. If it can't tell, it asks.
 
-- `unclear`: the bot asks one short question ("the course material, the slides, or
-  me?") and does nothing else; no daily-cap slot is used. The next mention is routed
-  again, with the answer in the thread.
-- Each mention is routed on its own, so one thread can have, say, a course PR and a
-  slides PR, each with its own branch, conversation and record. A follow-up such as
-  "also add X" in a thread with a slides or self PR goes to that PR.
-- `slides` and `self` are each off unless their repo is set; unset, the bot replies that
-  it can't do that here and runs nothing. Anyone can trigger either: the PR review is
-  the gate. Each repo needs the same GitHub App installed (same permissions) and a
-  ruleset on `main` like `protect_main`, with the app **not** on its bypass list. Each
-  run's token is limited to the one repo it works on. Neither has adversarial testing.
+- Claude can change more than one repo in one answer; each changed repo gets its own
+  `errata-bot/<thread>` branch and PR, checked by that repo's own rules. Its `repo`
+  answer only says which repo an issue (`NEEDS_HUMAN`) or a PR comment goes to.
+- One thread is one conversation, whichever repos it touches. A follow-up such as
+  "also add X" continues the PR it is about.
+- `slides` and `self` are each off unless their repo is set; unset, Claude never sees
+  them. Anyone can trigger either: the PR review is the gate. Each repo needs the same
+  GitHub App installed (same permissions) and a ruleset on `main` like `protect_main`,
+  with the app **not** on its bypass list. Each repo's pushes and API calls use a token
+  limited to that repo. Only course fixes get adversarial testing.
 
 ### Fixing slides
 
 `slides` (errata clearly about a lecture deck, e.g. "slide 12 of the PPO deck has the
-clipping sign wrong") works on `ERRATA_BOT_SLIDES_REPO` (e.g.
-`ARENA-education/arena-slides`, the Beamer decks) with `prompt_slides.md`, and opens or
-updates a `[errata-bot][slides 2.3]` PR there.
+clipping sign wrong") is `ERRATA_BOT_SLIDES_REPO` (e.g. `ARENA-education/arena-slides`,
+the Beamer decks), with the rules in `prompt_slides.md`; a change there opens or updates
+a `[errata-bot][slides 2.3]` PR.
 
 - It can only change existing `.tex` files under `chapter*/part*/`. The shared
   `arena_beamer.sty`, `template.tex`, `check-builds.sh`, dotfiles such as `.github/`,
@@ -104,9 +103,9 @@ updates a `[errata-bot][slides 2.3]` PR there.
 ### Fixing itself
 
 `self` (a request about the bot's own behaviour or capabilities, e.g. "tell your master
-to add you image seeing capabilities") works on `ERRATA_BOT_SELF_REPO` (e.g.
-`ARENA-education/errata-bot`) with `prompt_self.md`, and opens or updates a
-`[errata-bot][self]` PR there.
+to add you image seeing capabilities") is `ERRATA_BOT_SELF_REPO` (e.g.
+`ARENA-education/errata-bot`), with the rules in `prompt_self.md`; a change there opens or
+updates a `[errata-bot][self]` PR.
 
 - It can only change existing top-level `*.py`, `*.md` and `*.json` files. `deploy/`
   (which runs as root), `legacy/` and dotfiles such as `.github/` are always blocked.
@@ -114,8 +113,7 @@ to add you image seeing capabilities") works on `ERRATA_BOT_SELF_REPO` (e.g.
   `install.sh`) it lists in the PR and the reply for a maintainer to do; if it can do
   nothing, it files an issue on the bot's repo.
 - Changed files are compiled (`.py`) or parsed (`.json`) before the PR, never run.
-- A merged change does nothing until a maintainer pulls it on the server and runs
-  `deploy/install.sh`.
+- A merged change goes live within minutes: the server deploys `main` (see below).
 
 ### Images
 
@@ -124,8 +122,7 @@ with the bot token, outside the container) and mounted read-only at `/images` fo
 Read tool. Only png/jpg/gif/webp (checked by magic bytes), up to 5 MB and 10 per thread,
 from humans in that thread, from `files.slack.com` with no redirects followed. This needs
 the `files:read` bot scope (`deploy/slack-manifest.yml`, then reinstall the app); without it
-the downloads fail, are logged, and the run goes on without images. The routing step does
-not see images.
+the downloads fail, are logged, and the run goes on without images.
 
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
@@ -161,5 +158,9 @@ limit resets.
 5. Start with `ERRATA_BOT_DRY_RUN=true` in the env file (replies, no PRs); remove it
    and `systemctl restart errata-bot` once the replies look right.
 
-To update the code later, pull and re-run `install.sh`; it restarts the service.
+To update the code later, pull and re-run `install.sh`; it restarts the service. On the
+arena-proxy server this is automatic: a systemd timer (`errata-bot-autodeploy.timer`,
+script `/usr/local/sbin/errata-bot-autodeploy`) checks `main` every 2 minutes and, when it
+has moved, waits for any run in progress, runs `install.sh` and posts the new commits in
+`#errata-bot-test`. So merging to `main` deploys it.
 Each finished job logs its stage timings to the journal.

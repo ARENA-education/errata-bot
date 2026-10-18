@@ -21,6 +21,15 @@
       "type": "string",
       "description": "Reply to the reporter, posted in the Slack thread. Plain text, 1-5 sentences."
     },
+    "repo": {
+      "type": "string",
+      "enum": [
+        "course",
+        "self",
+        "slides"
+      ],
+      "description": "Which repository your answer is about: `course` (/work), `self` (/bot) or `slides` (/slides). An issue for NEEDS_HUMAN is filed there, and pr_comment goes on this thread's PR there. Edits are taken from every repository you changed, whatever this says. Default `course`."
+    },
     "section": {
       "type": "string",
       "description": "FIXED and NEEDS_HUMAN. The section the fix is in, e.g. '2.4' or '1.3.2'; or 'docs', 'tests', 'infra' if it is not in one section."
