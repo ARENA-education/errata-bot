@@ -117,6 +117,16 @@ to add you image seeing capabilities") works on `ERRATA_BOT_SELF_REPO` (e.g.
 - A merged change does nothing until a maintainer pulls it on the server and runs
   `deploy/install.sh`.
 
+### Images
+
+Images attached to a thread's messages are downloaded by the bot (`errata_bot.thread_images`,
+with the bot token, outside the container) and mounted read-only at `/images` for Claude's
+Read tool. Only png/jpg/gif/webp (checked by magic bytes), up to 5 MB and 10 per thread,
+from humans in that thread, from `files.slack.com` with no redirects followed. This needs
+the `files:read` bot scope (`deploy/slack-manifest.yml`, then reinstall the app); without it
+the downloads fail, are logged, and the run goes on without images. The routing step does
+not see images.
+
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
 limit resets.
