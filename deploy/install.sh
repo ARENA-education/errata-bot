@@ -11,7 +11,7 @@ id errata >/dev/null 2>&1 || useradd --system --home-dir /var/lib/errata-bot --s
 install -d -m 750 -g errata /etc/errata-bot
 install -d /opt/errata-bot
 install -m 644 "$ROOT/bot.py" "$ROOT/auth_proxy.py" "$ROOT/errata_bot.py" \
-  "$ROOT/adversarial.py" "$ROOT/prompt.md" "$ROOT/verdict.schema.json" \
+  "$ROOT/adversarial.py" "$ROOT/prompt.md" "$ROOT/prompt_self.md" "$ROOT/verdict.schema.json" \
   "$ROOT/attack.md" "$ROOT/attack.schema.json" /opt/errata-bot/
 [ -d /opt/errata-bot/venv ] || python3 -m venv /opt/errata-bot/venv
 /opt/errata-bot/venv/bin/pip install -q --upgrade slack_sdk 'pyjwt[crypto]' pyyaml tabulate

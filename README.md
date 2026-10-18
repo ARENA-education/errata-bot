@@ -30,6 +30,7 @@ the time Claude spends on the report.
 | `bot.py` | The service. Read its SECURITY note before editing. |
 | `errata_bot.py` | Shared helpers: Slack calls, blocked paths, parse-check, verdicts. |
 | `prompt.md` | What Claude is told: the triage rubric and master-file rules. |
+| `prompt_self.md` | What Claude is told instead in a self-fix thread (see below). |
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
 | `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's packages. No network. |
@@ -60,6 +61,27 @@ the course repo and is not wired up here.
   for that thread. Each finished run logs its token use and the plan's usage meters.
 - Every PR needs a maintainer's review like any other.
 
+## Fixing itself
+
+With `ERRATA_BOT_SELF_REPO` set (e.g. `ARENA-education/errata-bot`), a maintainer can
+start a new thread with `@errata-bot fix yourself` and what to change. That thread then
+works on the bot's own repo instead of the course: it opens or updates a
+`[errata-bot][self]` PR there, and every later mention in it does too. A course thread
+never switches: saying "fix yourself" in one gets a reply asking for a new thread.
+
+- Only people in `ERRATA_MAINTAINERS` can do this, in a new thread or in a follow-up;
+  anyone else gets a polite refusal and nothing runs (asking it to "do it anyway" does
+  not change that). Unset, the bot says self-fix is not enabled.
+- It can only change existing top-level `*.py`, `*.md` and `*.json` files. `deploy/`
+  (which runs as root), `legacy/` and dotfiles such as `.github/` are always blocked.
+- Changed files are compiled (`.py`) or parsed (`.json`) before the PR, never run. There
+  is no adversarial testing.
+- A merged change does nothing until a maintainer pulls it on the server and runs
+  `deploy/install.sh`.
+- Install the same GitHub App on the bot's repo (same permissions), and give that repo a
+  ruleset on `main` like `protect_main`, with the app **not** on its bypass list. Each
+  run's token is limited to the one repo it works on.
+
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
 limit resets.
@@ -68,7 +90,8 @@ limit resets.
 
 1. **GitHub App.** Organisation settings > Developer settings > GitHub Apps > New.
    Untick Webhook > Active; repository permissions Contents: Read and write, Pull
-   requests: Read and write; install on the repository only. Note its Client ID and
+   requests: Read and write; install on the repository only (plus the bot's own repo,
+   for self-fix). Note its Client ID and
    generate a private key.
 2. **Slack app.** api.slack.com/apps > Create New App > From a manifest; paste
    `deploy/slack-manifest.yml`. Generate an app-level token with `connections:write`

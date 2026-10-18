@@ -45,6 +45,19 @@ def allowed(rel: str) -> bool:
     return bool(rel) and not any(p.search(rel) for p in BLOCKED)
 
 
+# Self-fix (bot.py's ERRATA_BOT_SELF_REPO): in the bot's own repo, only its top-level code,
+# prompts and schemas may change. Always blocked, whatever else matches:
+#   - deploy/: install.sh, the systemd unit and the image run as root.
+#   - legacy/: not wired up; nothing there should change.
+#   - dotfiles and dot-dirs (.github/ etc.), as above.
+SELF_ALLOWED = re.compile(r"[^/]+\.(?:py|md|json)")
+SELF_BLOCKED = [BLOCKED[0], re.compile(r"^deploy/"), re.compile(r"^legacy/")]
+
+
+def allowed_self(rel: str) -> bool:
+    return bool(SELF_ALLOWED.fullmatch(rel)) and not any(p.search(rel) for p in SELF_BLOCKED)
+
+
 # Credential-shaped strings (Anthropic, Slack, GitHub, private keys); never let one out in
 # a reply, PR or commit.
 TOKEN_RE = re.compile(
@@ -203,15 +216,16 @@ def normalise_verdict(raw: str, log_hint: str) -> dict:
 # ---------------------------------------------------------------------------- apply
 
 
-def changed_allowed_files(work: Path, clean: Path) -> list[str]:
-    """Tracked files in `clean` that are not BLOCKED and whose bytes differ in `work`."""
+def changed_allowed_files(work: Path, clean: Path, is_allowed=allowed) -> list[str]:
+    """Tracked files in `clean` that `is_allowed` (by default: not BLOCKED) and whose bytes
+    differ in `work`."""
     tracked = subprocess.run(
         ["git", "-C", str(clean), "ls-files", "-z"], check=True, capture_output=True
     ).stdout.decode().split("\0")
     root = os.path.realpath(work)
     changed = []
     for rel in tracked:
-        if not allowed(rel):
+        if not is_allowed(rel):
             continue
         src = work / rel
         # Claude has a shell, so any path component may have been swapped for a symlink
@@ -244,6 +258,22 @@ def parse_check(clean: Path, masters: list[str]) -> str:
     return ""
 
 
+def self_check(clean: Path, changed: list[str]) -> str:
+    """The self-fix check: compile each changed .py and load each changed .json, running
+    nothing (no py_compile either: it would write __pycache__ into the checkout). Returns
+    the first file that fails, with why, or '' if all pass."""
+    for rel in changed:
+        try:
+            if rel.endswith(".py"):
+                compile((clean / rel).read_bytes(), rel, "exec")
+            elif rel.endswith(".json"):
+                json.loads((clean / rel).read_bytes())
+        except (SyntaxError, ValueError) as e:  # UnicodeDecodeError and JSONDecodeError are ValueErrors
+            print(f"{rel}: {e}")
+            return f"{rel} ({type(e).__name__}: {e})"[:300]
+    return ""
+
+
 def sections_of(changed: list[str], clean: Path) -> list[str]:
     """Section ids ("2.4", "1.3.2") that the changed files belong to, from the paths alone."""
     # exercise_dir and streamlit_page per section, from config.yaml (stdlib only: no yaml).
@@ -270,13 +300,14 @@ def sections_of(changed: list[str], clean: Path) -> list[str]:
     return sorted(found, key=lambda x: [int(n) for n in x.split(".")])
 
 
-def pr_title(verdict: dict, changed: list[str], clean: Path) -> str:
+def pr_title(verdict: dict, changed: list[str], clean: Path, tag: str = "") -> str:
     """`[errata-bot][2.4] <title>`. The section comes from the changed files where it can,
-    so the tag always says what the PR touches; Claude's `section` is the fallback."""
-    sections = sections_of(changed, clean)
+    so the tag always says what the PR touches; Claude's `section` is the fallback. A
+    given `tag` (`self` for a self-fix) replaces both."""
+    sections = [] if tag else sections_of(changed, clean)
     if sections:
         tag = ",".join(sections)
-    else:  # README, shared helpers, ...: whatever Claude said, if it is tag-shaped
+    elif not tag:  # README, shared helpers, ...: whatever Claude said, if it is tag-shaped
         tag = re.sub(r"[^\w.,-]", "", str(verdict.get("section") or ""))[:20] or "misc"
     # Claude may still have put its own [tags] at the front of the title: drop them.
     title = re.sub(r"^(?:\s*\[[^\]]*\])+", "", " ".join(str(verdict.get("pr_title", "")).split())).strip()
