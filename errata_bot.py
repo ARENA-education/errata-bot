@@ -121,9 +121,61 @@ def cmd_fetch(args):
 FOOTER_RE = re.compile(r"\n*`[^`\n]*↻[^`\n]*`\s*$")
 
 
-def read_thread(channel: str, ts: str, thread_ts: str, after: str = "") -> str:
+IMAGE_MAGIC = {b"\x89PNG\r\n\x1a\n": "png", b"\xff\xd8\xff": "jpg", b"GIF87a": "gif", b"GIF89a": "gif"}
+IMAGE_MAX_BYTES = 5_000_000
+IMAGE_MAX_COUNT = 10
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *a, **kw):
+        return None  # the bot token must only ever go to files.slack.com
+
+
+def image_type(data: bytes) -> str:
+    """png/jpg/gif/webp by magic bytes (never by the name or mimetype Slack reports), or ""."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+    return next((ext for magic, ext in IMAGE_MAGIC.items() if data.startswith(magic)), "")
+
+
+def thread_images(channel: str, ts: str, thread_ts: str, dest: Path) -> dict[str, str]:
+    """Download the images attached by humans in the thread up to the mention at `ts` into
+    `dest`, under names we choose. Returns {slack file id: file name}. Runs here, outside the
+    container, with the bot token; the container only ever sees `dest`, read-only."""
+    messages = slack("conversations.replies", channel=channel, ts=thread_ts, limit=100)["messages"]
+    opener = urllib.request.build_opener(_NoRedirect)
+    found: dict[str, str] = {}
+    for m in messages:
+        if float(m["ts"]) > float(ts):
+            break
+        if m.get("bot_id"):
+            continue
+        for f in m.get("files") or []:
+            fid, url = str(f.get("id", "")), f.get("url_private") or ""
+            if (not re.fullmatch(r"F[A-Z0-9]+", fid) or fid in found or len(found) >= IMAGE_MAX_COUNT
+                    or not str(f.get("mimetype", "")).startswith("image/") or f.get("size", 0) > IMAGE_MAX_BYTES
+                    or urllib.parse.urlparse(url).netloc != "files.slack.com"):
+                continue
+            try:
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {os.environ['SLACK_BOT_TOKEN']}"})
+                with opener.open(req, timeout=30) as resp:
+                    data = resp.read(IMAGE_MAX_BYTES + 1)
+            except Exception as e:  # e.g. the app lacks files:read; the run goes on without the image
+                print(f"(image {fid} skipped: {e})")
+                continue
+            ext = image_type(data)
+            if not ext or len(data) > IMAGE_MAX_BYTES:
+                continue
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / f"{fid}.{ext}").write_bytes(data)
+            found[fid] = f"{fid}.{ext}"
+    return found
+
+
+def read_thread(channel: str, ts: str, thread_ts: str, after: str = "", images: dict[str, str] | None = None) -> str:
     """The thread up to and including the mention at `ts`, formatted for the prompt.
-    With `after`, only the messages posted after that ts (for a resumed conversation)."""
+    With `after`, only the messages posted after that ts (for a resumed conversation).
+    With `images` (from thread_images), attached images are listed as /images/<name>."""
     # The bot reads exactly one thread: the one it was mentioned in. Its own earlier
     # replies are kept, so a follow-up mention continues the same conversation.
     messages = slack("conversations.replies", channel=channel, ts=thread_ts, limit=100)["messages"]
@@ -136,6 +188,10 @@ def read_thread(channel: str, ts: str, thread_ts: str, after: str = "") -> str:
         text = re.sub(r"<@[A-Z0-9]+>", "", m.get("text", "")).strip()
         if m.get("bot_id"):
             text = FOOTER_RE.sub("", text)
+        for f in (m.get("files") or []) if images and not m.get("bot_id") else []:
+            if str(f.get("id")) in images:
+                text += f"\n[attached image: /images/{images[str(f['id'])]}]"
+        text = text.strip()
         if not text:
             continue
         if m.get("bot_id"):
