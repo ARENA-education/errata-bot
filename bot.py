@@ -875,6 +875,13 @@ def push_and_open_pr(t: Target, clean: Path, changed: list[str], verdict: dict, 
     if t.pr_note:
         body += f"\n{t.pr_note}\n"
     pr = github("POST", f"/repos/{t.repo}/pulls", token, {"title": title, "head": branch, "base": "main", "body": body})
+    # Course PRs from the bot count as CONTRIBUTOR, so pr-preview.yml only publishes
+    # their website preview once they carry the `preview` label.
+    if t.name == "course":
+        try:
+            github("POST", f"/repos/{t.repo}/issues/{pr['number']}/labels", token, {"labels": ["preview"]})
+        except urllib.error.HTTPError as e:
+            log.warning("could not add preview label to PR #%s: %s", pr["number"], e)
     return pr["html_url"]
 
 
