@@ -17,7 +17,7 @@ It only ever acts when mentioned, and it only ever reads the thread it was menti
 @errata-bot in #errata
   -> Slack Socket Mode (an outbound connection from the server; no public URL)
   -> bot.py: 👀 straight away, then one job at a time:
-       read the thread -> route it (the course, or the bot itself?) -> check out main (or the thread's PR branch) from a clone kept
+       read the thread -> route it (the course, the slides, or the bot itself?) -> check out main (or the thread's PR branch) from a clone kept
        on disk -> Claude Code in a throwaway container -> copy back allowed files,
        parse-check -> push errata-bot/<thread> branch, open/update PR -> reply
 ```
@@ -30,8 +30,8 @@ the time Claude spends on the report.
 | `bot.py` | The service. Read its SECURITY note before editing. |
 | `errata_bot.py` | Shared helpers: Slack calls, blocked paths, parse-check, verdicts. |
 | `prompt.md` | What Claude is told: the triage rubric and master-file rules. |
-| `prompt_self.md` | What Claude is told instead for a change to the bot itself (see below). |
-| `route.md`, `route.schema.json` | The routing step: is a mention about the course or the bot? |
+| `prompt_self.md`, `prompt_slides.md` | What Claude is told instead for a change to the bot itself, or to the slide decks (see below). |
+| `route.md`, `route.schema.json` | The routing step: is a mention about the course, the slides or the bot? |
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
 | `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's packages. No network. |
@@ -62,37 +62,60 @@ the course repo and is not wired up here.
   for that thread. Each finished run logs its token use and the plan's usage meters.
 - Every PR needs a maintainer's review like any other.
 
-## Fixing itself
+## Targets: the course, the slides, and itself
 
-Before each run, a short routing step decides whether the mention is about the course
-or about the bot itself: Claude (`ERRATA_BOT_ROUTE_MODEL`, default haiku) reads the
-thread text only (`route.md`), and answers `course`, `self` or `unclear` in a fixed
-schema (`route.schema.json`). Almost everything is `course`, including bug reports that
-mention or complain about the bot. `self` is for requests about the bot's own behaviour
-or capabilities, e.g. "tell your master to add you image seeing capabilities". If the
+Before each run, a short routing step decides what the mention is about: Claude
+(`ERRATA_BOT_ROUTE_MODEL`, default haiku) reads the thread text only (`route.md`), and
+answers `course`, `slides`, `self` or `unclear` in a fixed schema (`route.schema.json`).
+Almost everything is `course`, including bug reports that mention or complain about the
+bot, and reports about an exercise or notebook whose topic also has slides. If the
 routing call fails, it is `course`.
 
-- `unclear`: the bot asks one short question ("the course material, or me?") and does
-  nothing else; no daily-cap slot is used. The next mention is routed again, with the
-  answer in the thread.
-- `self`, with `ERRATA_BOT_SELF_REPO` set (e.g. `ARENA-education/errata-bot`): the run
-  works on the bot's own repo with `prompt_self.md` and opens or updates a
-  `[errata-bot][self]` PR there. Anyone can ask; the PR review, and the fact that nothing
-  goes live until a maintainer runs `deploy/install.sh`, are the gate. Unset, the bot
-  replies that self-fixing isn't enabled and runs nothing.
-- Each mention is routed on its own, so one thread can have a course PR and a self PR,
-  each with its own branch, conversation and record. A follow-up such as "also add X" in
-  a thread with a self PR goes to that PR.
+- `unclear`: the bot asks one short question ("the course material, the slides, or
+  me?") and does nothing else; no daily-cap slot is used. The next mention is routed
+  again, with the answer in the thread.
+- Each mention is routed on its own, so one thread can have, say, a course PR and a
+  slides PR, each with its own branch, conversation and record. A follow-up such as
+  "also add X" in a thread with a slides or self PR goes to that PR.
+- `slides` and `self` are each off unless their repo is set; unset, the bot replies that
+  it can't do that here and runs nothing. Anyone can trigger either: the PR review is
+  the gate. Each repo needs the same GitHub App installed (same permissions) and a
+  ruleset on `main` like `protect_main`, with the app **not** on its bypass list. Each
+  run's token is limited to the one repo it works on. Neither has adversarial testing.
+
+### Fixing slides
+
+`slides` (errata clearly about a lecture deck, e.g. "slide 12 of the PPO deck has the
+clipping sign wrong") works on `ERRATA_BOT_SLIDES_REPO` (e.g.
+`ARENA-education/arena-slides`, the Beamer decks) with `prompt_slides.md`, and opens or
+updates a `[errata-bot][slides 2.3]` PR there.
+
+- It can only change existing `.tex` files under `chapter*/part*/`. The shared
+  `arena_beamer.sty`, `template.tex`, `check-builds.sh`, dotfiles such as `.github/`,
+  images and other binaries are always blocked, and it cannot add decks.
+- Many decks exist only as Google Slides, which it cannot edit. For a deck that isn't in
+  the repo it makes no edit and files an issue on the slides repo describing the erratum,
+  for a maintainer to fix in Google Slides.
+- There is no TeX in the sandbox, so changed files only get a structural check (braces
+  and `\begin`/`\end` balance) before the PR; the slides repo's CI builds both modes of
+  every deck on the PR. (Adding TeX to `deploy/Dockerfile.claude` would allow a real build
+  here, at the cost of a much bigger image.)
+
+### Fixing itself
+
+`self` (a request about the bot's own behaviour or capabilities, e.g. "tell your master
+to add you image seeing capabilities") works on `ERRATA_BOT_SELF_REPO` (e.g.
+`ARENA-education/errata-bot`) with `prompt_self.md`, and opens or updates a
+`[errata-bot][self]` PR there.
+
 - It can only change existing top-level `*.py`, `*.md` and `*.json` files. `deploy/`
   (which runs as root), `legacy/` and dotfiles such as `.github/` are always blocked.
   What it can't change (a Slack scope in `deploy/slack-manifest.yml`, the Dockerfile,
   `install.sh`) it lists in the PR and the reply for a maintainer to do; if it can do
   nothing, it files an issue on the bot's repo.
-- Changed files are compiled (`.py`) or parsed (`.json`) before the PR, never run. There
-  is no adversarial testing.
-- Install the same GitHub App on the bot's repo (same permissions), and give that repo a
-  ruleset on `main` like `protect_main`, with the app **not** on its bypass list. Each
-  run's token is limited to the one repo it works on.
+- Changed files are compiled (`.py`) or parsed (`.json`) before the PR, never run.
+- A merged change does nothing until a maintainer pulls it on the server and runs
+  `deploy/install.sh`.
 
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
@@ -102,8 +125,8 @@ limit resets.
 
 1. **GitHub App.** Organisation settings > Developer settings > GitHub Apps > New.
    Untick Webhook > Active; repository permissions Contents: Read and write, Pull
-   requests: Read and write; install on the repository only (plus the bot's own repo,
-   for self-fix). Note its Client ID and
+   requests: Read and write; install on the repository only (plus the slides and the bot's own
+   repos, for those targets). Note its Client ID and
    generate a private key.
 2. **Slack app.** api.slack.com/apps > Create New App > From a manifest; paste
    `deploy/slack-manifest.yml`. Generate an app-level token with `connections:write`

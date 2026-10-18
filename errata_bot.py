@@ -58,6 +58,18 @@ def allowed_self(rel: str) -> bool:
     return bool(SELF_ALLOWED.fullmatch(rel)) and not any(p.search(rel) for p in SELF_BLOCKED)
 
 
+# Slides (bot.py's ERRATA_BOT_SLIDES_REPO, the Beamer decks): only a deck's .tex files,
+# chapter*/part*/**.tex. Always blocked: dotfiles and .github/ (CI), the shared preamble
+# and template (they change every deck: a maintainer's job), check-builds.sh, and
+# anything that is not .tex (images and other binaries).
+SLIDES_ALLOWED = re.compile(r"chapter[^/]*/part[^/]*/(?:[^/]+/)*[^/]+\.tex")
+SLIDES_BLOCKED = [BLOCKED[0], re.compile(r"^(?:arena_beamer\.sty|template\.tex|check-builds\.sh)$")]
+
+
+def allowed_slides(rel: str) -> bool:
+    return bool(SLIDES_ALLOWED.fullmatch(rel)) and not any(p.search(rel) for p in SLIDES_BLOCKED)
+
+
 # Credential-shaped strings (Anthropic, Slack, GitHub, private keys); never let one out in
 # a reply, PR or commit.
 TOKEN_RE = re.compile(
@@ -272,6 +284,61 @@ def self_check(clean: Path, changed: list[str]) -> str:
             print(f"{rel}: {e}")
             return f"{rel} ({type(e).__name__}: {e})"[:300]
     return ""
+
+
+TEX_TOKEN = re.compile(r"\\(begin|end)\s*\{([^{}]*)\}|\\[A-Za-z@]+|\\.|%[^\n]*|[{}\n]", re.S)
+# Verbatim code (listings, \verb|...|) may hold any braces: blanked out, keeping its lines.
+TEX_VERBATIM = re.compile(r"\\begin\{(lstlisting|verbatim\*?|Verbatim|minted)\}.*?\\end\{\1\}"
+                          r"|\\(?:verb|lstinline)\*?([^\sA-Za-z{]).*?\2", re.S)
+
+
+def tex_check(clean: Path, changed: list[str]) -> str:
+    """The slides check, structural only (there is no TeX here; the slides repo's CI builds
+    every PR): in each changed .tex file, braces balance and every \\begin{x} has its
+    \\end{x}, ignoring escapes (\\{, \\%) and comments. Returns the first failure or ''."""
+    for rel in changed:
+        try:
+            text = (clean / rel).read_bytes().decode("utf-8")
+        except UnicodeDecodeError as e:
+            return f"{rel} (not UTF-8: {e})"[:300]
+        text = TEX_VERBATIM.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+        depth, line, envs = 0, 1, []
+        for m in TEX_TOKEN.finditer(text):
+            tok = m.group(0)
+            if tok == "\n":
+                line += 1
+            elif tok in "{}":
+                depth += 1 if tok == "{" else -1
+                if depth < 0:
+                    return f"{rel} (unmatched }} on line {line})"
+            elif m.group(1) == "begin":
+                envs.append((m.group(2), line))
+            elif m.group(1) == "end":
+                if not envs or envs[-1][0] != m.group(2):
+                    return f"{rel} (\\end{{{m.group(2)}}} on line {line} does not match " + (
+                        f"\\begin{{{envs[-1][0]}}} on line {envs[-1][1]})" if envs else "any \\begin)")
+                envs.pop()
+        if depth:
+            return f"{rel} ({depth} unclosed {{)"
+        if envs:
+            return f"{rel} (\\begin{{{envs[-1][0]}}} on line {envs[-1][1]} is never ended)"
+    return ""
+
+
+def slide_sections(changed: list[str]) -> list[str]:
+    """Deck ids ("2.3", "1.3.1") from slides paths: chapter2_*/part3_* and chapter1_*/part3_1_*."""
+    found = set()
+    for rel in changed:
+        if m := re.match(r"chapter(\d+)_[^/]*/part(\d+)(?:_(\d+))?_", rel):
+            found.add(".".join(g for g in m.groups() if g))
+    return sorted(found, key=lambda x: [int(n) for n in x.split(".")])
+
+
+def slides_tag(verdict: dict, changed: list[str]) -> str:
+    """`slides 2.3` from the decks a slides fix touches, else from Claude's `section` (an
+    issue about a deck that isn't in the repo), if it is tag-shaped."""
+    return ("slides " + (",".join(slide_sections(changed))
+                         or re.sub(r"[^\w.,-]", "", str(verdict.get("section") or ""))[:20])).strip()
 
 
 def sections_of(changed: list[str], clean: Path) -> list[str]:
