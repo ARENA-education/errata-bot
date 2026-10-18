@@ -13,10 +13,11 @@ and a single worker then:
      `errata-bot/<thread>` branch and opens or updates a PR against main,
   5. replies in the thread.
 
-Self-fix: each mention is first routed (route()): a short Claude call on the thread text
-alone decides whether it is about the course, this bot, or unclear. "unclear" gets a
-clarifying question and nothing else (no run, no daily-cap slot). "self" works on the
-bot's own repo, ERRATA_BOT_SELF_REPO (the Target "self" below: its own clone, allowed
+Targets: each mention is first routed (route()): a short Claude call on the thread text
+alone decides whether it is about the course, this bot ("self"), the slide decks
+("slides"), or unclear. "unclear" gets a clarifying question and nothing else (no run,
+no daily-cap slot). "self" and "slides" work on ERRATA_BOT_SELF_REPO and
+ERRATA_BOT_SLIDES_REPO (the Targets in ALL below: each with its own clone, allowed
 files, check, prompt, record and session); unset, the bot just says so.
 
 SECURITY. The thread is untrusted text and Claude reads it, so Claude's output is
@@ -27,15 +28,19 @@ adds the real token on the way. Everything that holds a token happens here, outs
 the container, and files matching errata_bot.BLOCKED (dotfiles,
 .github/, infrastructure/core/, this directory) are never copied back. Pushes use the errata-bot GitHub App, which must never be on the
 protect_main ruleset's bypass list: that ruleset is what makes writing to main
-impossible. The route is Claude's judgement on untrusted text, and anyone can ask for a
-self-fix, so treat the route as untrusted too: it comes only from a schema-checked
+impossible. The route is Claude's judgement on untrusted text, and anyone can trigger
+any target, so treat the route as untrusted too: it comes only from a schema-checked
 enum (a failure or anything else means the course), from a session with no repo and
 no tool beyond Read on an empty directory, and it only picks which Target's rules
-apply; a wrong route at worst opens a PR on the other repo for a human to close. A self-fix run
-copies back only errata_bot.allowed_self files (top-level *.py, *.md, *.json; never
-deploy/, legacy/ or dotfiles), checks them by compiling, never by running them, and
-gets a token for the bot's repo alone. Nothing it changes runs until a maintainer
-merges it and runs install.sh. The bot's own repo needs the same kind of ruleset on main.
+apply; a wrong route at worst opens a PR on another repo for a human to close. Each
+run gets a token for its own repo alone. A self-fix run copies back only
+errata_bot.allowed_self files (top-level *.py, *.md, *.json; never deploy/, legacy/ or
+dotfiles) and checks them by compiling, never by running them; nothing it changes runs
+until a maintainer merges it and runs install.sh. A slides run copies back only
+errata_bot.allowed_slides files (existing chapter*/part*/**.tex; never the shared
+preamble, the template, CI or images) and checks them structurally, never running TeX;
+that repo's own CI builds the PR. Every target repo needs a ruleset on main like
+protect_main, without the app on its bypass list.
 
 Configuration: environment variables, see errata-bot.env.example. Setup: README.md.
 """
@@ -85,8 +90,9 @@ PR_CACHE = RUNS_DIR / "_pr_cache"  # open PRs' diffs and issues' comments, keyed
 PR_DIFF_MAX = 200_000  # bytes of diff kept per PR
 
 GH_REPO = os.environ["GH_REPO"]  # e.g. ARENA-education/ARENA_materials
-# The bot's own repo, for requests to change the bot itself; unset disables self-fix.
-SELF_REPO = os.environ.get("ERRATA_BOT_SELF_REPO", "").strip()
+# Optional extra targets (see ALL below); unset, a mention routed to one gets a "not enabled" reply.
+SELF_REPO = os.environ.get("ERRATA_BOT_SELF_REPO", "").strip()  # the bot's own repo
+SLIDES_REPO = os.environ.get("ERRATA_BOT_SLIDES_REPO", "").strip()  # the Beamer slide decks
 # Channel ids (C...) the bot answers in, comma-separated. ERRATA_CHANNEL is the old name.
 ERRATA_CHANNELS = {c.strip() for c in os.environ.get("ERRATA_CHANNELS", os.environ.get("ERRATA_CHANNEL", "")).split(",") if c.strip()}
 if not ERRATA_CHANNELS:
@@ -104,30 +110,56 @@ CLAUDE_TIMEOUT = 20 * 60
 # The model that attacks a code or test fix (adversarial.py). Sonnet by default: opus
 # found more, but used the subscription's weekly allowance too fast.
 ATTACK_MODEL = os.environ.get("ERRATA_BOT_ATTACK_MODEL", "sonnet")
-# The model that decides whether a mention is about the course or the bot (route()).
+# The model that decides which target a mention is about (route()).
 ROUTE_MODEL = os.environ.get("ERRATA_BOT_ROUTE_MODEL", "haiku")
 
 
 @dataclass(frozen=True)
 class Target:
-    """What a thread works on: the course (GH_REPO) or, for self-fix, this bot (SELF_REPO)."""
-    name: str  # "course" or "self", as route() answers
-    repo: str
+    """What a mention works on: the course (GH_REPO), or an optional extra repo."""
+    name: str  # as route() answers
+    repo: str  # "" when not enabled
     dir: Path  # its clone on disk
     cache: Path  # its open PRs' diffs and issues' comments
     prompt: str  # instructions for Claude, in HERE
     allowed: Callable[[str], bool]  # which files a fix may change
     check: Callable[[Path, list[str]], str]  # (checkout, changed files) -> what failed, or ""
-    tag: str = ""  # PR title tag; "" means the sections the fix touches
+    tag: Callable[[dict, list[str]], str] | None = None  # PR title tag from (verdict, changed); None: course sections
     adversarial: bool = True  # attack code and test fixes (adversarial.py is built around the course's tests)
+    took: str = ""  # added to its Slack replies, so that a wrong route is easy to spot
+    pr_note: str = ""  # added to a new PR's description
+    off: str = ""  # the reply when a mention is routed here but `repo` is not set
+
+    @property
+    def suffix(self) -> str:
+        """Its thread records and sessions are <thread><suffix>, so a thread can have one per target."""
+        return "" if self.name == "course" else f"-{self.name}"
 
 
-TARGETS = {"course": Target(
-    "course", GH_REPO, REPO_DIR, PR_CACHE, "prompt.md", eb.allowed,
-    lambda clean, changed: (s := eb.parse_check(clean, [f for f in changed if "/master_" in f])) and f"section {s}")}
-if SELF_REPO:
-    TARGETS["self"] = Target("self", SELF_REPO, STATE / "repo-self", RUNS_DIR / "_pr_cache_self", "prompt_self.md",
-                             eb.allowed_self, eb.self_check, tag="self", adversarial=False)
+def _course_check(clean: Path, changed: list[str]) -> str:
+    section = eb.parse_check(clean, [f for f in changed if "/master_" in f])
+    return f"section {section}" if section else ""
+
+
+def _extra(name: str, repo: str, **kw) -> Target:
+    return Target(name, repo, STATE / f"repo-{name}", RUNS_DIR / f"_pr_cache_{name}", f"prompt_{name}.md",
+                  adversarial=False, **kw)
+
+
+ALL = {t.name: t for t in [
+    Target("course", GH_REPO, REPO_DIR, PR_CACHE, "prompt.md", eb.allowed, _course_check),
+    _extra("self", SELF_REPO, allowed=eb.allowed_self, check=eb.self_check, tag=lambda verdict, changed: "self",
+           took="I took this as a request to change me, errata-bot, so any PR is on {repo}.",
+           pr_note="A change to errata-bot itself: it only goes live when a maintainer runs `deploy/install.sh` after merging.",
+           off="This looks like a request to change me, errata-bot, rather than the course material, but fixing myself "
+               "isn't enabled here"),
+    _extra("slides", SLIDES_REPO, allowed=eb.allowed_slides, check=eb.tex_check, tag=eb.slides_tag,
+           took="I took this as being about the slide decks, so any PR or issue is on {repo}.",
+           pr_note="The LaTeX build is checked by this repo's CI on the PR.",
+           off="This looks like it's about the lecture slides, but fixing slides isn't enabled here"),
+]}
+TARGETS = {n: t for n, t in ALL.items() if t.repo}
+ROUTES = [*ALL, "unclear"]  # must match route.schema.json
 
 jobs: "queue.Queue[dict]" = queue.Queue()
 seen: set[str] = set()  # mention ts already queued; Slack can redeliver after a reconnect
@@ -314,11 +346,11 @@ def reply(channel: str, thread_ts: str, text: str) -> None:
 
 CAP_REPLY = (f"I've reached my limit of {DAILY_CAP} reports in 24 hours, so I haven't looked at this one. "
              "Mention me again tomorrow, or flag it to a maintainer.")
-UNCLEAR_REPLY = ("Is this about the course material (if so, which section?) or about me, the bot (how I behave or "
-                 "what I can do)? Mention me again with the answer and I'll pick it up.")
-SELF_OFF_REPLY = ("This looks like a request to change me, errata-bot, rather than the course material, but fixing "
-                  "myself isn't enabled here, so I haven't changed anything. Please flag it to a maintainer. If you "
-                  "meant the course material, say so and mention me again.")
+UNCLEAR_REPLY = ("Is this about the course material (exercises, notebooks, instructions: which section?), the "
+                 "lecture slides (which deck?), or me, the bot (how I behave or what I can do)? Mention me again with "
+                 "the answer and I'll pick it up.")
+OFF_REPLY = (", so I haven't changed anything. Please flag it to a maintainer. If you meant the course material, "
+             "say so and mention me again.")
 
 
 def on_request(client: SocketModeClient, req: SocketModeRequest) -> None:
@@ -521,16 +553,15 @@ def prune_sessions() -> None:
 
 
 def route(channel: str, ts: str, thread_ts: str, key: str) -> tuple[str, str, float]:
-    """Whether this mention asks about the course or about the bot itself: ("course",
-    "self" or "unclear", Claude's one-line reason, cost). A short session that sees the
-    thread text alone (no repo, no GitHub, Read on an empty directory); if it fails or
-    gives anything but one of those, the course."""
+    """Which target this mention is about: (one of ROUTES, Claude's one-line reason, cost).
+    A short session that sees the thread text alone (no repo, no GitHub, Read on an empty
+    directory); if it fails or gives anything else, the course."""
     run = RUNS_DIR / f"route-{ts.replace('.', '-')}"
     shutil.rmtree(run, ignore_errors=True)
     (run / "work").mkdir(parents=True)
     (run / "session").mkdir()
     # So that "also do X" can continue whichever conversation this thread already has.
-    has = [n for n, suffix in (("course", ""), ("self", "-self")) if (THREADS / f"{key}{suffix}.json").exists()]
+    has = [n for n, t in ALL.items() if (THREADS / f"{key}{t.suffix}.json").exists()]
     prompt = (HERE / "route.md").read_text()
     prompt += f"\n<earlier>\nThis thread already has: {', '.join(f'a {n} conversation' for n in has) or 'nothing'}.\n</earlier>\n"
     prompt += f"\n<thread>\n{eb.read_thread(channel, ts, thread_ts)}</thread>\n"
@@ -546,7 +577,7 @@ def route(channel: str, ts: str, thread_ts: str, key: str) -> tuple[str, str, fl
     out = out if isinstance(out, dict) else {}
     answer = out.get("structured_output")
     cost = out.get("total_cost_usd") or 0.0
-    if out.get("is_error") or not isinstance(answer, dict) or answer.get("target") not in ("course", "self", "unclear"):
+    if out.get("is_error") or not isinstance(answer, dict) or answer.get("target") not in ROUTES:
         return "course", "no valid routing answer, so the course", cost
     return answer["target"], eb.TOKEN_RE.sub("[redacted]", " ".join(str(answer.get("reason") or "").split()))[:200], cost
 
@@ -568,15 +599,15 @@ def handle(job: dict) -> str:
     if where == "unclear":
         reply(channel, thread_ts, UNCLEAR_REPLY)
         return "question"
-    if where == "self" and "self" not in TARGETS:
-        reply(channel, thread_ts, SELF_OFF_REPLY)
+    t = ALL[where]
+    if not t.repo:
+        reply(channel, thread_ts, t.off + OFF_REPLY)
         return ""
     if not take_slot():
         reply(channel, thread_ts, CAP_REPLY)
         return "low_battery"
-    t = TARGETS[where]
     # Each target has its own record, session and PR, so a thread can have one of each.
-    key += "-self" if t.name == "self" else ""
+    key += t.suffix
     record_path = THREADS / f"{key}.json"
     try:
         record = json.loads(record_path.read_text())  # {"session_id", "last_ts"}
@@ -767,8 +798,8 @@ def handle(job: dict) -> str:
             except Exception as e:  # e.g. no Issues permission: the Slack reply still goes out
                 log.warning("filing an issue failed: %s", e)
         text = eb.safe_mentions(verdict["slack_reply"], eb.thread_users(channel, ts, thread_ts))
-        if t.name == "self":
-            text += f"\n\n(I took this as a request to change me, errata-bot, so any PR is on {t.repo}.)"
+        if t.took:
+            text += f"\n\n({t.took.format(repo=t.repo)})"
         if model != MODEL:
             text += f"\n\n(Answered with {model}. Say \"use {MODEL}\" to switch back.)"
         if pushed:
@@ -822,7 +853,7 @@ def flag_on_pr(repo: str, number: int, tested, verdict: dict, token: str) -> Non
 def push_and_open_pr(t: Target, clean: Path, changed: list[str], verdict: dict, branch: str, pr_url: str,
                      permalink: str, token: str) -> str:
     assert branch.startswith("errata-bot/"), branch  # never anything else, and never main
-    title = eb.pr_title(verdict, changed, clean, t.tag)
+    title = eb.pr_title(verdict, changed, clean, t.tag(verdict, changed) if t.tag else "")
     app = github("GET", "/app", jwt.encode(
         {"iat": int(time.time()) - 60, "exp": int(time.time()) + 540, "iss": APP_CLIENT_ID},
         Path(APP_KEY_FILE).read_text(), algorithm="RS256"))
@@ -841,8 +872,8 @@ def push_and_open_pr(t: Target, clean: Path, changed: list[str], verdict: dict, 
         "Opened automatically by errata-bot from a Slack report. "
         "The diagnosis and the fix are both unreviewed: please check them before merging.\n"
     )
-    if t.name == "self":
-        body += "\nA change to errata-bot itself: it only goes live when a maintainer runs `deploy/install.sh` after merging.\n"
+    if t.pr_note:
+        body += f"\n{t.pr_note}\n"
     pr = github("POST", f"/repos/{t.repo}/pulls", token, {"title": title, "head": branch, "base": "main", "body": body})
     return pr["html_url"]
 
@@ -874,8 +905,8 @@ def file_issue(t: Target, verdict: dict, clean: Path, changed: list[str], permal
         github("POST", f"/repos/{t.repo}/issues/{target}/comments", token, {"body": body})
         url = f"https://github.com/{t.repo}/issues/{target}"
     else:
-        title = eb.pr_title({"pr_title": verdict.get("issue_title") or verdict.get("pr_title"),
-                             "section": verdict.get("section")}, changed, clean, t.tag)
+        v = {"pr_title": verdict.get("issue_title") or verdict.get("pr_title"), "section": verdict.get("section")}
+        title = eb.pr_title(v, changed, clean, t.tag(v, changed) if t.tag else "")
         issue = github("POST", f"/repos/{t.repo}/issues", token, {"title": title, "body": body})
         target, url = issue["number"], issue["html_url"]
     record["issue"] = target
@@ -927,13 +958,13 @@ def worker() -> None:
 def main() -> None:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     auth_proxy.serve(AUTH_DIR / "anthropic.sock", auth_proxy.tokens_from_env())
-    ensure_clone(TARGETS["course"])  # the self clone is made on its first run, with a token in case it is private
+    ensure_clone(TARGETS["course"])  # the others are cloned on their first run, with a token in case they are private
     threading.Thread(target=worker, daemon=True).start()
     client = SocketModeClient(app_token=os.environ["SLACK_APP_TOKEN"])
     client.socket_mode_request_listeners.append(on_request)
     client.connect()  # reconnects by itself if the connection drops
-    log.info("connected; mentions in %s -> %s%s (model %s, cap %d/24h%s)",
-             ",".join(sorted(ERRATA_CHANNELS)), GH_REPO, f", self-fix -> {SELF_REPO}" if SELF_REPO else "",
+    log.info("connected; mentions in %s -> %s (model %s, cap %d/24h%s)",
+             ",".join(sorted(ERRATA_CHANNELS)), ", ".join(f"{n}: {t.repo}" for n, t in TARGETS.items()),
              f"{MODEL} of {','.join(MODELS)}", DAILY_CAP, ", DRY RUN" if DRY_RUN else "")
     threading.Event().wait()
 

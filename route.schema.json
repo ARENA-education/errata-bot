@@ -11,9 +11,10 @@
       "enum": [
         "course",
         "self",
+        "slides",
         "unclear"
       ],
-      "description": "'course' for anything about the course material (almost every mention); 'self' only for a request that is clearly about the bot's own behaviour or capabilities; 'unclear' only for real ambiguity."
+      "description": "'course' for anything about the course material (almost every mention); 'slides' only for errata clearly about a lecture slide deck; 'self' only for a request that is clearly about the bot's own behaviour or capabilities; 'unclear' only for real ambiguity."
     },
     "reason": {
       "type": "string",

@@ -25,9 +25,10 @@ you think is right and say plainly in `pr_summary` what a reviewer should check.
 - `adversarial.py`, `attack.md`, `attack.schema.json`: the adversarial reviewer of course
   code and test fixes.
 - `auth_proxy.py`: forwards the container's API calls, adding the real token.
-- `prompt.md` (course runs) and `prompt_self.md` (this file): what Claude is told.
+- `prompt.md` (course runs), `prompt_slides.md` (slide-deck runs) and `prompt_self.md`
+  (this file): what Claude is told. The targets themselves are the `ALL` table in `bot.py`.
 - `route.md`, `route.schema.json`: the routing step that decides, per mention, whether
-  it is about the course, the bot, or unclear (`route()` in `bot.py`).
+  it is about the course, the slides, the bot, or unclear (`route()` in `bot.py`).
 - `verdict.schema.json`: the shape of Claude's answer.
 - `README.md`: setup and behaviour, for maintainers.
 - `deploy/` (install script, systemd unit, Dockerfile, env example, Slack manifest) and
