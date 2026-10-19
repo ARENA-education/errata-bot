@@ -57,6 +57,7 @@ the course repo and is not wired up here.
 - The service and its containers share one CPU and 2 GiB of memory (`errata.slice`),
   so it cannot starve the proxy on the same machine. Jobs run one at a time.
 - At most 100 runs in any 24 hours (`ERRATA_BOT_DAILY_CAP`).
+- Once a day (and shortly after start) it lists each target repo's closed PRs and adds :m: to the Slack thread named in the "Reported in Slack" line of every merged `errata-bot/` PR. Polling, not a webhook, as the bot has no public URL. The first run looks back over the last 500 closed PRs.
 - Model: `ERRATA_BOT_MODEL` (default sonnet). Anyone can pick another for a thread by saying
   "use opus" (or `haiku`, `fable`; see `ERRATA_BOT_MODELS`) when mentioning the bot; it sticks
   for that thread. Each finished run logs its token use and the plan's usage meters.

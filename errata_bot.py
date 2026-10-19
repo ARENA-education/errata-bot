@@ -102,6 +102,15 @@ def slack(method: str, **params) -> dict:
     return out
 
 
+SLACK_LINK_RE = re.compile(r"Reported in Slack: https://[\w.-]+\.slack\.com/archives/(C\w+)/p(\d{10})(\d{6})\b")
+
+
+def slack_origin(pr_body: str) -> tuple[str, str] | None:
+    """(channel, thread_ts) of the Slack thread a bot PR's description says it came from."""
+    m = SLACK_LINK_RE.search(pr_body or "")
+    return (m.group(1), f"{m.group(2)}.{m.group(3)}") if m else None
+
+
 def cmd_fetch(args):
     # Acknowledge straight away so the reporter knows the mention was seen.
     try:

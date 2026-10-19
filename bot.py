@@ -79,6 +79,7 @@ HERE = Path(__file__).resolve().parent
 STATE = Path(os.environ.get("STATE_DIRECTORY", "/var/lib/errata-bot"))
 REPO_DIR = STATE / "repo"
 RUNS_DIR = STATE / "runs"
+MARKED = STATE / "merged_marked.json"  # "repo#number" of merged bot PRs whose Slack thread has had MERGED
 HISTORY = STATE / "history.json"  # start times of recent runs, for the daily cap
 AUTH_DIR = STATE / "auth"  # holds the socket auth_proxy serves to the container
 # One Claude Code conversation per Slack thread, so a follow-up mention resumes it: the
@@ -326,6 +327,7 @@ OUTCOME = {
     "ERROR": "x",
     # REPLY: none; the answer is the outcome
 }
+MERGED = "m"  # added to the thread's first message once its fix PR is merged
 busy = threading.Event()  # set while the worker is running a job
 
 
@@ -997,11 +999,52 @@ def worker() -> None:
             busy.clear()
 
 
+def mark_merged() -> None:
+    """React MERGED on the Slack thread of every merged errata-bot PR. The link between a PR
+    and its thread is the "Reported in Slack: <permalink>" line in its description, so
+    nothing needs storing but the PRs already handled. GitHub could push merges to us only
+    through a webhook, which needs a public URL this bot deliberately lacks, so worker
+    threads poll instead: one list call per repo per day. The first run (no MARKED file)
+    looks at the last 500 closed PRs, to catch up on ones merged before this existed."""
+    try:
+        done = set(json.loads(MARKED.read_text()))
+        first = False
+    except (OSError, ValueError):
+        done, first = set(), True
+    for t in TARGETS.values():
+        token = app_token(t.repo)
+        for page in range(1, 6 if first else 2):
+            batch = github("GET", f"/repos/{t.repo}/pulls?state=closed&sort=updated&direction=desc&per_page=100&page={page}", token)
+            for pr in batch:
+                key = f"{t.repo}#{pr['number']}"
+                if not pr.get("merged_at") or not pr["head"]["ref"].startswith("errata-bot/") or key in done:
+                    continue
+                origin = eb.slack_origin(pr.get("body"))
+                if origin and origin[0] in ERRATA_CHANNELS:
+                    react(*origin, MERGED)
+                    log.info("marked %s merged in thread %s", key, origin[1])
+                done.add(key)
+            if len(batch) < 100:
+                break
+    MARKED.write_text(json.dumps(sorted(done)))
+
+
+def merged_loop() -> None:
+    while True:
+        time.sleep(60)  # let the connection come up first
+        try:
+            mark_merged()
+        except Exception:
+            log.exception("marking merged PRs failed; will retry tomorrow")
+        time.sleep(86400)
+
+
 def main() -> None:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     auth_proxy.serve(AUTH_DIR / "anthropic.sock", auth_proxy.tokens_from_env())
     ensure_clone(TARGETS["course"])  # the others are cloned on their first run, with a token in case they are private
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=merged_loop, daemon=True).start()
     client = SocketModeClient(app_token=os.environ["SLACK_APP_TOKEN"])
     client.socket_mode_request_listeners.append(on_request)
     client.connect()  # reconnects by itself if the connection drops
