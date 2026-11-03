@@ -325,7 +325,7 @@ OUTCOME = {
     "NEEDS_HUMAN": "x",                   # the bot could not do it: a maintainer must step in
     "BUILD_FAILED": "x",
     "ERROR": "x",
-    # REPLY: none; the answer is the outcome
+    "REPLY": "speech_balloon",            # answered a question; no edits
 }
 MERGED = "m"  # added to the thread's first message once its fix PR is merged
 busy = threading.Event()  # set while the worker is running a job
