@@ -165,3 +165,9 @@ script `/usr/local/sbin/errata-bot-autodeploy`) checks `main` every 2 minutes an
 has moved, waits for any run in progress, runs `install.sh` and posts the new commits in
 `#errata-bot-test`. So merging to `main` deploys it.
 Each finished job logs its stage timings to the journal.
+
+## Reuse
+
+The ARENA maintainers welcome reuse of this codebase, with attribution to ARENA
+(ARENA-education/errata-bot). The code was written largely by Claude. This is a
+statement of intent, not a formal license; see the maintainers' note in the PR.
