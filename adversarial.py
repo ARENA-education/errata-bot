@@ -20,7 +20,9 @@ files before the fix) becomes the certificate posted on the PR.
 """
 
 import json
+import os
 import re
+import stat
 import shutil
 import subprocess
 import time
@@ -82,9 +84,21 @@ class Result:
         return bool(self.cases) and not self.problems and not self.note
 
 
+def safe_read(path: Path, limit: int = 1_000_000) -> str:
+    """Read a regular file the reviewer wrote, never following a symlink or blocking on a FIFO."""
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise OSError("not a regular file")
+        with os.fdopen(fd, "rb", closefd=False) as f:
+            return f.read(limit).decode(errors="replace")
+    finally:
+        os.close(fd)
+
+
 def parse_case(path: Path) -> Case | None:
     try:
-        source = path.read_text(errors="replace")
+        source = safe_read(path)
     except OSError:
         return None
     head = "\n".join(source.splitlines()[:40])
@@ -99,7 +113,8 @@ def parse_case(path: Path) -> Case | None:
 
 def load_cases(adv: Path) -> list[Case]:
     cases = []
-    for p in sorted((adv / "cases").glob("*.py")) if (adv / "cases").is_dir() else []:
+    d = adv / "cases"
+    for p in sorted(d.glob("*.py")) if d.is_dir() and not d.is_symlink() else []:
         if CASE_NAME.match(p.name) and p.is_file() and not p.is_symlink():
             c = parse_case(p)
             if c:
@@ -235,7 +250,13 @@ def run(*, work: Path, orig: Path, run_dir: Path, name: str, verdict: dict, raw:
         res.extra_cost = max(res.extra_cost, float(out_a.get("total_cost_usd") or 0.0))  # session total so far
         attack_id = out_a.get("session_id") or attack_id
         summary = str((out_a.get("structured_output") or {}).get("summary") or out_a.get("result") or "").strip()
-        if not (adv / "run_case.py").is_file() or not load_cases(adv):
+        try:
+            safe_read(adv / "run_case.py", 1)
+        except OSError:
+            res.note = "the reviewer did not produce a runnable run_case.py"
+            res.rounds.append(f"Round {round_no}: no runnable cases were produced.")
+            break
+        if not load_cases(adv):
             res.note = "the reviewer did not produce runnable cases" + (f" ({summary[:200]})" if summary else "")
             res.rounds.append(f"Round {round_no}: no runnable cases were produced.")
             break
@@ -264,7 +285,7 @@ def run(*, work: Path, orig: Path, run_dir: Path, name: str, verdict: dict, raw:
         res.rounds[-1] += " The fixer revised the fix." + (f" Its notes: {str(v.get('test_notes'))[:600]}" if v.get("test_notes") else "")
 
     try:
-        res.runner = (adv / "run_case.py").read_text(errors="replace")
+        res.runner = safe_read(adv / "run_case.py")
     except OSError:
         pass
     # The "before" column: the cases that should be caught, against the files before the fix.
