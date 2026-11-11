@@ -5,7 +5,8 @@
 # have a shell and run the course code without any secret being in reach.
 #
 # Python is CPU-only and has no network, so: small checks, tests.py on tiny inputs, no
-# model downloads. Rebuild to pick up a newer Claude Code: install.sh does this.
+# model downloads (only the GPT-2 tokenizer is baked in, below). Rebuild to pick up a
+# newer Claude Code: install.sh does this.
 FROM node:22-slim
 
 RUN apt-get update -qq \
@@ -15,13 +16,23 @@ RUN apt-get update -qq \
 RUN npm install -g @anthropic-ai/claude-code && npm cache clean --force
 
 # The course's pure-Python stack, CPU builds. Anything needing a GPU, a model download
-# or an API key is out of reach anyway, so it is not installed.
+# or an API key is out of reach anyway, so it is not installed. transformer_lens and
+# transformers are pinned to the course's requirements.txt range: library behaviour
+# (e.g. whether the tokenizer prepends BOS) must match what students run.
 RUN python3 -m venv /opt/py \
  && /opt/py/bin/pip install -q --no-cache-dir --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch torchvision \
  && /opt/py/bin/pip install -q --no-cache-dir \
       numpy einops jaxtyping typeguard pytest tqdm tabulate pandas scipy scikit-learn \
-      matplotlib plotly ipython gymnasium transformer_lens \
+      matplotlib plotly ipython gymnasium \
+      "transformer_lens>=3.9,<4" "transformers>=5.9,<6" \
       "eindex-callum @ git+https://github.com/ARENA-education/eindex.git"
+
+# GPT-2 tokenizer files only (~3 MB), so tokenization questions can be checked offline.
+# The weights don't fit: HookedTransformer gpt2-small peaks at ~2.2 GB RSS vs the 1536m cap.
+ENV HF_HOME=/opt/hf
+RUN /opt/py/bin/python -c "from huggingface_hub import snapshot_download; \
+snapshot_download('gpt2', allow_patterns=['config.json', 'tokenizer.json', 'tokenizer_config.json', 'vocab.json', 'merges.txt'])" \
+ && chmod -R a+rX /opt/hf
 
 ENV PATH=/opt/py/bin:$PATH \
     PYTHONDONTWRITEBYTECODE=1 \

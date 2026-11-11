@@ -34,7 +34,7 @@ the time Claude spends on the report.
 | `prompt_self.md`, `prompt_slides.md` | Appended to it when the bot's own repo, or the slide decks, are enabled (see below). |
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
-| `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's packages. No network. |
+| `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's pinned packages and the GPT-2 tokenizer. No network. |
 | `auth_proxy.py` | Forwards the container's API calls to api.anthropic.com over a unix socket, adding the real token, so the token never enters the container. |
 | `deploy/errata-bot.service`, `deploy/errata.slice` | systemd unit, and the 1 CPU / 2 GiB cap it runs under. |
 | `deploy/install.sh` | Installs or updates everything on the server. |
