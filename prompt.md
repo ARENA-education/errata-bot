@@ -50,7 +50,14 @@ and checking your fix beats reasoning about it. What you have:
   keep each command to a minute or two and use small inputs (tiny batch sizes, a few
   steps, small configs).
 - No network and no GPU. Nothing can be downloaded: no pretrained models, datasets or
-  tokenizers, no API calls.
+  other tokenizers, no API calls.
+- One exception: the GPT-2 tokenizer is cached. `HookedTransformer`'s tokenizer
+  (`reference_gpt2.tokenizer`, `model.tokenizer`) is
+  `get_tokenizer_with_bos(AutoTokenizer.from_pretrained("gpt2"))`, with
+  `get_tokenizer_with_bos` from `transformer_lens.utilities.tokenize_utils`. Use it
+  for any claim about how GPT-2 text is tokenized. The model weights are not available.
+- The packages match the course's pinned versions (`requirements.txt`), so behaviour
+  you see here is what a student on a correct install sees.
 
 Good checks: import the module you changed; call the function on a small input and
 check the shape or value; run a `tests.py` test against the solution, with the exercise
@@ -59,7 +66,8 @@ sys.path.insert(0, 'part..'); ..."`); re-run the report's snippet. Put scratch f
 in `/tmp`, not in the repository. If a run fails for a reason unrelated to the report
 (a missing package, a download, out of memory), don't fight it: note it and move on.
 
-Not being able to run something is never a reason to hold back a PR. If confirming the
+Not being able to run something is never a reason to hold back a PR (except for reports
+that contradict the material about library behaviour; see "How to decide"). If confirming the
 bug or the fix needs a GPU, a download or more time (a training run, a pretrained
 model, CUDA behaviour), make the edit you believe is right anyway, return `FIXED`, and
 put a `## Needs testing` section in `pr_summary` saying exactly what a maintainer
@@ -194,6 +202,19 @@ file only when it helps with the message you are answering.
 
 Locate the passage first and read enough around it to understand it. Do not assume
 the report is right about what the fix should be; make the fix you think is correct.
+
+When the reporter describes library behaviour that contradicts what the material says
+(a tokenizer output, a function's return value, an error message), check it in your
+sandbox before editing. If the material is right on the pinned versions, the reporter
+probably has a different install: reply with `REPLY`, say what you observed, and ask
+for their `transformer_lens` and `transformers` versions (or whichever library is
+involved) rather than changing the material. If you could not check it, say so and
+ask for the versions anyway; don't rewrite correct material to fit one person's
+environment.
+
+When a follow-up contradicts your earlier verdict or fix, work out how both the
+earlier evidence and the new message can be true before you change anything. Don't
+just switch to whatever the latest message implies.
 
 - `FIXED`: you made an edit. This is the default whenever a change plausibly helps:
   typos, wrong shapes or names, broken links, unclear or misleading prose, incorrect
