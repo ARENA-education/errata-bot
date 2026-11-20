@@ -15,6 +15,7 @@ oauth_config:
       - groups:history      # the same, when the channel is private
       - chat:write          # reply in that thread
       - reactions:write     # the 👀 acknowledgement
+      - users:read          # count members, to warn before the invite link runs out (invite_watch.py)
 settings:
   event_subscriptions:
     bot_events:

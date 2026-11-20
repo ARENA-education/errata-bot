@@ -70,6 +70,7 @@ from slack_sdk.socket_mode.response import SocketModeResponse
 
 import adversarial
 import auth_proxy
+import invite_watch
 import errata_bot as eb  # shared with the GitHub Actions version: Slack, verdict, blocked files
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
@@ -1048,6 +1049,7 @@ def main() -> None:
     client = SocketModeClient(app_token=os.environ["SLACK_APP_TOKEN"])
     client.socket_mode_request_listeners.append(on_request)
     client.connect()  # reconnects by itself if the connection drops
+    invite_watch.start(STATE / "invite.json", " ".join(f"<@{u}>" for u in sorted(eb.MAINTAINERS)))
     log.info("connected; mentions in %s -> %s (model %s, cap %d/24h%s)",
              ",".join(sorted(ERRATA_CHANNELS)), ", ".join(f"{n}: {t.repo}" for n, t in TARGETS.items()),
              f"{MODEL} of {','.join(MODELS)}", DAILY_CAP, ", DRY RUN" if DRY_RUN else "")
