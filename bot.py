@@ -102,7 +102,7 @@ if not ERRATA_CHANNELS:
     raise SystemExit("Set ERRATA_CHANNELS to the Slack channel id(s) the bot should answer in.")
 APP_CLIENT_ID = os.environ["ERRATA_APP_CLIENT_ID"]
 APP_KEY_FILE = os.environ.get("ERRATA_APP_KEY_FILE", "/etc/errata-bot/app.pem")
-MODEL = os.environ.get("ERRATA_BOT_MODEL", "sonnet")  # default; a thread can pick another
+MODEL = os.environ.get("ERRATA_BOT_MODEL", "opus")  # default; a thread can pick another
 # Models a Slack user may pick for a thread ("@errata-bot use opus"); passed to `claude --model`.
 MODELS = [m.strip() for m in os.environ.get("ERRATA_BOT_MODELS", "haiku,sonnet,opus,fable").split(",") if m.strip()]
 MODEL_RE = re.compile(r"\b(?:use|with|switch to|model[:=]?)\s+(" + "|".join(map(re.escape, MODELS)) + r")\b", re.I)
