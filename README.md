@@ -35,6 +35,7 @@ the time Claude spends on the report.
 | `verdict.schema.json` | The shape of Claude's answer. |
 | `adversarial.py`, `attack.md`, `attack.schema.json` | The adversarial reviewer: a second Claude session that tries to break a code or test fix before the PR. |
 | `deploy/Dockerfile.claude` | The container Claude runs in: Claude Code, a shell, and CPU-only Python with the course's pinned packages and the GPT-2 tokenizer. No network. |
+| `invite_watch.py` | Warns in Slack before the public invite link runs out (see below). |
 | `auth_proxy.py` | Forwards the container's API calls to api.anthropic.com over a unix socket, adding the real token, so the token never enters the container. |
 | `deploy/errata-bot.service`, `deploy/errata.slice` | systemd unit, and the 1 CPU / 2 GiB cap it runs under. |
 | `deploy/install.sh` | Installs or updates everything on the server. |
@@ -124,6 +125,20 @@ Read tool. Only png/jpg/gif/webp (checked by magic bytes), up to 5 MB and 10 per
 from humans in that thread, from `files.slack.com` with no redirects followed. This needs
 the `files:read` bot scope (`deploy/slack-manifest.yml`, then reinstall the app); without it
 the downloads fail, are logged, and the run goes on without images.
+
+### Invite link watch
+
+Separate from errata: with `ERRATA_INVITE_ALERT_CHANNEL` set, the bot warns in that channel
+(tagging `ERRATA_MAINTAINERS`) before the public Slack invite link dies. A link stops working
+after 400 joins, or on the expiry date chosen when it was made, and Slack has no way to ask
+whether one still works, so `invite_watch.py` counts: every hour it reads the link from the
+redirect page (`ERRATA_INVITE_PAGE`) and counts the workspace's accounts. It warns once at 350
+joins since that link went up, again at 400, and, if `ERRATA_INVITE_EXPIRES_DAYS` is set, 5
+days before the expiry and on it. Putting a new link on the page restarts the count. Everyone
+who joins is counted, including people invited by email, so a warning can be early, never late.
+The count for a link starts when the bot first sees it, so it misses joins from before this
+was switched on. This needs the `users:read` bot scope (`deploy/slack-manifest.yml`, then
+reinstall the app); without it the check fails and is logged each hour.
 
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
