@@ -5,7 +5,7 @@ A Slack invite link dies after 400 people have joined through it, or on the expi
 chosen when it was made. Slack offers no way to ask whether a link is still good (its
 join page turns away anything that is not a person's browser), so this counts instead.
 
-Every hour it reads the redirect page everyone is sent to (INVITE_PAGE) to learn the
+Once a day it reads the redirect page everyone is sent to (INVITE_PAGE) to learn the
 current link, and counts the workspace's human accounts with users.list. Deactivated
 accounts stay in that list, so the count only ever grows, and its growth since the link
 first appeared on the page is the number of people who have joined: an upper bound on
@@ -37,7 +37,8 @@ EXPIRES_DAYS = float(os.environ.get("ERRATA_INVITE_EXPIRES_DAYS", "0") or 0)
 MAX_USES = 400  # Slack's limit per link
 WARN_USES = 350
 WARN_DAYS_LEFT = 5
-INTERVAL = 3600
+INTERVAL = 86400  # daily; a restart also checks
+RETRY = 3600  # after a failed check
 
 LINK_RE = re.compile(r"https://join\.slack\.com/t/[\w-]+/shared_invite/[\w~-]+")
 
@@ -94,6 +95,7 @@ def check(state: dict, link: str, members: int, now: float) -> tuple[dict, list[
 def loop(state_file: Path, post: Callable[[str], None]) -> None:
     time.sleep(90)  # let the connection come up first
     while True:
+        wait = INTERVAL
         try:
             link = current_link()
             if link is None:
@@ -113,7 +115,8 @@ def loop(state_file: Path, post: Callable[[str], None]) -> None:
                 state_file.write_text(json.dumps(new))  # after posting: a failed post is retried
         except Exception:
             log.exception("invite link check failed; will retry in an hour")
-        time.sleep(INTERVAL)
+            wait = RETRY
+        time.sleep(wait)
 
 
 def start(state_file: Path, tag: str = "") -> None:

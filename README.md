@@ -131,14 +131,14 @@ the downloads fail, are logged, and the run goes on without images.
 Separate from errata: with `ERRATA_INVITE_ALERT_CHANNEL` set, the bot warns in that channel
 (tagging `ERRATA_MAINTAINERS`) before the public Slack invite link dies. A link stops working
 after 400 joins, or on the expiry date chosen when it was made, and Slack has no way to ask
-whether one still works, so `invite_watch.py` counts: every hour it reads the link from the
+whether one still works, so `invite_watch.py` counts: once a day it reads the link from the
 redirect page (`ERRATA_INVITE_PAGE`) and counts the workspace's accounts. It warns once at 350
 joins since that link went up, again at 400, and, if `ERRATA_INVITE_EXPIRES_DAYS` is set, 5
 days before the expiry and on it. Putting a new link on the page restarts the count. Everyone
 who joins is counted, including people invited by email, so a warning can be early, never late.
 The count for a link starts when the bot first sees it, so it misses joins from before this
 was switched on. This needs the `users:read` bot scope (`deploy/slack-manifest.yml`, then
-reinstall the app); without it the check fails and is logged each hour.
+reinstall the app); without it the check fails, is logged, and is retried each hour.
 
 Claude runs on the subscription whose token is `CLAUDE_CODE_OAUTH_TOKEN`. When its
 allowance is used up, the bot replies with Claude's own message, which says when the
