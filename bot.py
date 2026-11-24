@@ -447,17 +447,34 @@ def context_size(session_dir: Path, session_id: str) -> int:
     return 0
 
 
+def model_name(out: dict, fallback: str) -> str:
+    """The model that did the run, e.g. `opus5.5`, from the result's modelUsage (keyed by
+    full model id). Claude Code also makes small side calls on another model, so take the
+    one that wrote the most output."""
+    mu = out.get("modelUsage") or {}
+    if not mu:
+        return fallback
+    mid = max(mu, key=lambda m: (mu[m] or {}).get("outputTokens") or 0)
+    mid = re.sub(r"-\d{8}$", "", mid.removeprefix("claude-"))  # drop a date suffix
+    return re.sub(r"^([a-z]+)-(\d+)-(\d+)$", r"\1\2.\3", mid)  # opus-5-5 -> opus5.5
+
+
 def footer(model: str, out: dict, ctx: int, cost: float) -> str:
-    """`sonnet 52k(45k⚡) ctx31k $0.06 5h12%↻2h13m 7d9%↻3d4h 24h7/100`, added by us, not Claude."""
+    """`opus5.5 52k(45k⚡) ctx31k $0.06 5h12%↻2h13m 7d9%↻3d4h 24h7/100`, added by us, not Claude.
+    A usage window the API did not report (no utilization header) is left out."""
     u = out.get("usage", {})
     cached = u.get("cache_read_input_tokens") or 0
     total = cached + sum(u.get(k) or 0 for k in ("input_tokens", "cache_creation_input_tokens", "output_tokens"))
     plan = auth_proxy.USAGE
-    pct = lambda k: f"{float(plan[k]):.0%}" if k in plan else "?"
+    meters = ""
+    for w in ("5h", "7d"):
+        try:
+            meters += f"{w}{float(plan[f'{w}-utilization']):.0%}↻{_until(plan.get(f'{w}-reset'))} "
+        except (KeyError, TypeError, ValueError):
+            pass
     acct = f"acct{auth_proxy.ACCOUNT + 1} " if auth_proxy.ACCOUNTS > 1 else ""
-    return (f"`{model} {_k(total)}({_k(cached)}⚡) ctx{_k(ctx)} ${cost:.2f} {acct}"
-            f"5h{pct('5h-utilization')}↻{_until(plan.get('5h-reset'))} "
-            f"7d{pct('7d-utilization')}↻{_until(plan.get('7d-reset'))} 24h{runs_today()}/{DAILY_CAP}`")
+    return (f"`{model_name(out, model)} {_k(total)}({_k(cached)}⚡) ctx{_k(ctx)} ${cost:.2f} {acct}"
+            f"{meters}24h{runs_today()}/{DAILY_CAP}`")
 
 
 def pr_comments(repo: str, number: int, token: str, skip: set[str] = frozenset()) -> tuple[str, list[str], set[str]]:
